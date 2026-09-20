@@ -54,7 +54,11 @@ CREATE TABLE audit_log (
     updated_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_audit_status
-        CHECK (status IN ('pending', 'approved', 'executed', 'failed', 'cancelled', 'superseded'))
+    CHECK (status IN (
+        'pending', 'awaiting_input',
+        'approved', 'executed', 'failed', 'cancelled', 'superseded'
+    ))
+
 );
 
 CREATE INDEX idx_audit_chat_status
