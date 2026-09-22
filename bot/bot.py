@@ -320,6 +320,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 json={
                     "chat_id": update.effective_chat.id,
                     "text": update.message.text,
+                    "message_id": update.message.message_id,
                 },
             )
     except Exception as e:

@@ -169,6 +169,43 @@ def test_feedback_regenerates_same_audit(client, db, fake_llm, make_intent):
     )
 
 
+def test_feedback_shows_llm_its_current_draft(client, fake_llm, make_intent):
+    fake_llm.queue(make_intent())
+    audit_id = _draft(client).json()["audit_id"]
+
+    fake_llm.queue(make_intent(amount=6))
+    client.post("/internal/feedback", json={"audit_id": audit_id, "feedback": "6"})
+
+    current = fake_llm.calls[-1]["current_draft"]
+    assert current["amount"] == 4
+    assert current["habit_name"] == "running"
+    # Our bookkeeping keys stay out of the prompt.
+    assert not {"habit_id", "attempts", "metric_source", "needs"} & current.keys()
+
+
+def test_clarify_shows_llm_its_current_draft(client, fake_llm, make_intent):
+    fake_llm.queue(make_intent(metric=None))
+    audit_id = _draft(client, "ran 4").json()["audit_id"]
+
+    fake_llm.queue(make_intent(metric="km"))
+    client.post("/internal/clarify", json={"audit_id": audit_id, "value": "km"})
+
+    current = fake_llm.calls[-1]["current_draft"]
+    assert (current["amount"], current["metric"]) == (4, None)
+
+
+def test_draft_records_message_id_and_duration(client, db, fake_llm, make_intent):
+    fake_llm.queue(make_intent())
+
+    client.post(
+        "/internal/draft", json={"chat_id": CHAT, "text": "ran 4", "message_id": 555}
+    )
+
+    audit = _audits(db)[-1]
+    assert audit.message_id == 555
+    assert audit.duration_ms is not None and audit.duration_ms >= 0
+
+
 def test_feedback_on_executed_audit_is_409(client, fake_llm, make_intent):
     fake_llm.queue(make_intent())
     audit_id = _draft(client).json()["audit_id"]

@@ -1,0 +1,94 @@
+"""
+Bot handler tests. Telegram objects are stand-ins exposing only what the
+handlers touch; the API is an httpx.MockTransport. No network calls.
+"""
+
+import os
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import httpx
+import pytest
+
+ALLOWED_USER = 42
+CHAT = 4242
+
+# bot.settings reads these at import time.
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:test")
+os.environ.setdefault("TELEGRAM_ALLOWED_USER_ID", str(ALLOWED_USER))
+
+_RealAsyncClient = httpx.AsyncClient
+
+
+class FakeAPI:
+    def __init__(self):
+        self.routes: dict[tuple[str, str], tuple[int, object]] = {}
+        self.requests: list[httpx.Request] = []
+        self.timeouts: dict[str, object] = {}
+
+    def on(self, method: str, path: str, status: int = 200, json=None):
+        self.routes[(method, path)] = (status, json)
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        key = (request.method, request.url.path)
+        if key not in self.routes:
+            raise AssertionError(f"unexpected API call: {key}")
+        status, body = self.routes[key]
+        return httpx.Response(status, json=body)
+
+    def client(self, timeout=None, **kwargs):
+        client = _RealAsyncClient(
+            transport=httpx.MockTransport(self._handle), timeout=timeout, **kwargs
+        )
+        original_request = client.request
+
+        async def request(method, url, **kw):
+            self.timeouts[httpx.URL(str(url)).path] = timeout
+            return await original_request(method, url, **kw)
+
+        client.request = request
+        return client
+
+    def last_json(self):
+        import json
+
+        return json.loads(self.requests[-1].content)
+
+
+@pytest.fixture
+def api(monkeypatch):
+    import bot
+
+    fake = FakeAPI()
+    monkeypatch.setattr(bot.httpx, "AsyncClient", fake.client)
+    return fake
+
+
+def make_update(text=None, user_id=ALLOWED_USER, message_id=10, callback_data=None):
+    message = SimpleNamespace(text=text, message_id=message_id, reply_text=AsyncMock())
+    query = None
+    if callback_data is not None:
+        query = SimpleNamespace(
+            data=callback_data,
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            message=SimpleNamespace(message_id=message_id),
+        )
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=CHAT),
+        message=message,
+        callback_query=query,
+    )
+
+
+def make_context(**user_data):
+    return SimpleNamespace(
+        user_data=dict(user_data),
+        bot=SimpleNamespace(edit_message_text=AsyncMock()),
+    )
+
+
+def replies(update) -> list[str]:
+    return [c.args[0] for c in update.message.reply_text.await_args_list]

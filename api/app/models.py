@@ -2,8 +2,17 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
-    BigInteger, Boolean, CheckConstraint, Date, DateTime,
-    ForeignKey, Integer, Numeric, String, Text, text,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Date,
+    DateTime,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -18,7 +27,7 @@ class Habit(Base):
     name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     display_name: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
-    metric: Mapped[str] = mapped_column(String(50), nullable=False)
+    metric: Mapped[str | None] = mapped_column(String(50))  # NULL if no natural unit
     target_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
     target_metric: Mapped[str | None] = mapped_column(String(50))
     is_active: Mapped[bool] = mapped_column(

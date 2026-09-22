@@ -13,6 +13,7 @@ class ExtractRequest(BaseModel):
     previous_error: str | None = None
     clarification: str | None = None
     original_text: str | None = None
+    current_draft: dict | None = None
 
 
 class ExtractResponse(BaseModel):
@@ -34,7 +35,8 @@ def extract(req: ExtractRequest):
             previous_error=req.previous_error,
             clarification=req.clarification,
             original_text=req.original_text,
+            current_draft=req.current_draft,
         )
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
+        raise HTTPException(status_code=502, detail=f"LLM call failed: {e}") from e
     return ExtractResponse(intent=intent)

@@ -1,3 +1,5 @@
+import time
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select, text
@@ -9,6 +11,13 @@ from app.drafting import regenerate_from_feedback, run_loop1
 from app.models import AuditLog, DailyLog, Habit
 
 router = APIRouter(prefix="/internal", tags=["internal"])
+
+
+def _record_duration(audit: AuditLog, started: float, db: Session):
+    """Store how long drafting took (all LLM attempts) on the audit row."""
+    audit.duration_ms = int((time.monotonic() - started) * 1000)
+    db.commit()
+    db.refresh(audit)
 
 
 # ------------------------------------------------------------------
@@ -38,6 +47,7 @@ def list_habits(db: Session = Depends(get_db)):
 class DraftRequest(BaseModel):
     chat_id: int
     text: str
+    message_id: int | None = None
 
 
 class DraftResponse(BaseModel):
@@ -52,7 +62,10 @@ class DraftResponse(BaseModel):
 
 @router.post("/draft", response_model=DraftResponse)
 def draft(req: DraftRequest, db: Session = Depends(get_db)):
+    started = time.monotonic()
     audit, clarify_prompt, proposal_prompt = run_loop1(req.text, req.chat_id, db)
+    audit.message_id = req.message_id
+    _record_duration(audit, started, db)
 
     if clarify_prompt:
         return DraftResponse(
@@ -120,10 +133,11 @@ def clarify(req: ClarifyRequest, db: Session = Depends(get_db)):
         new_intent = drafting.call_llm(
             original_text=audit.user_input,
             clarification=req.value,
+            current_draft=drafting.llm_view(intent),
             habits=drafting.habits_context(db),
         )
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
+        raise HTTPException(status_code=502, detail=f"LLM call failed: {e}") from e
 
     metric = new_intent.get("metric") or new_intent.get("suggested_metric")
     if not metric:
@@ -340,9 +354,11 @@ def feedback(req: FeedbackRequest, db: Session = Depends(get_db)):
             status_code=409, detail=f"Audit status is {audit.status}"
         )
 
+    started = time.monotonic()
     audit, clarify_prompt, proposal_prompt = regenerate_from_feedback(
         audit, req.feedback, db
     )
+    _record_duration(audit, started, db)
 
     if clarify_prompt:
         return DraftResponse(

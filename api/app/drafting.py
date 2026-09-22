@@ -1,5 +1,4 @@
 import math
-import re
 from datetime import date
 from typing import Optional
 
@@ -9,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import AuditLog, Habit
+from app.sqlguard import bind_nulls, check_draft_sql
 from app.timeutil import today
 
 
@@ -35,6 +35,20 @@ def habits_context(db: Session) -> list[dict]:
     ]
 
 
+# Keys of the LLM intent contract (llm/semantics.yaml: intent_shape).
+INTENT_KEYS = (
+    "habit_name", "proposed_habit", "amount", "metric",
+    "suggested_metric", "log_date", "confidence", "draft_sql",
+)
+
+
+def llm_view(intent: Optional[dict]) -> Optional[dict]:
+    """An audit's intent without our bookkeeping keys, to show the LLM its draft."""
+    if not intent:
+        return None
+    return {k: intent.get(k) for k in INTENT_KEYS}
+
+
 def call_llm(**kwargs) -> dict:
     r = httpx.post(
         f"{settings.llm_base_url}/extract",
@@ -49,18 +63,14 @@ def _dry_run_sql(db: Session, sql: str) -> Optional[str]:
     if not sql or not isinstance(sql, str):
         return "draft_sql is missing"
 
-    forbidden = ("drop", "delete", "update", "truncate", "alter", "grant")
-    lowered = sql.lower()
-    for word in forbidden:
-        if f" {word} " in f" {lowered} ":
-            return f"forbidden operation: {word}"
-
-    test_sql = re.sub(r":[a-zA-Z_][a-zA-Z0-9_]*", "NULL", sql)
+    shape_error = check_draft_sql(sql)
+    if shape_error:
+        return shape_error
 
     try:
         # Savepoint: a failing EXPLAIN must not abort the caller's transaction.
         with db.begin_nested():
-            db.execute(text(f"EXPLAIN {test_sql}"))
+            db.execute(text(f"EXPLAIN {bind_nulls(sql)}"))
         return None
     except Exception as e:
         return str(e).split("\n")[0]
@@ -298,6 +308,7 @@ def regenerate_from_feedback(
             kwargs = {
                 "original_text": audit.user_input,
                 "clarification": feedback,
+                "current_draft": llm_view(audit.intent),
                 "habits": habits,
             }
             if attempt > 1 and last_intent:
