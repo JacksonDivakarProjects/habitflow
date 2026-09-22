@@ -18,6 +18,10 @@ Telegram ──> bot ──HTTP──> api ──HTTP──> llm ──> Groq (L
 | `llm/` | FastAPI wrapper around Groq. Builds the prompt from `semantics.yaml`. |
 | `db/init/` | Schema and seed data, applied when the Postgres volume is first created. |
 
+**Setting it up, using it, running it or fixing it?** See the
+[usage guide and SOP](docs/SOP.md), including how
+[reminders and time zones](docs/SOP.md#3-reminders-and-time) work.
+
 ## How a message becomes a log
 
 1. **Draft (Loop 1).** `api` asks `llm` for an intent: habit, amount, unit,
