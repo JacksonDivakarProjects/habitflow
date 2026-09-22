@@ -16,7 +16,7 @@ Telegram ──> bot ──HTTP──> api ──HTTP──> llm ──> Groq (L
 | `bot/` | Telegram front end (python-telegram-bot). Single allowed user. |
 | `api/` | FastAPI. Drafting loop, validation, approval state machine, writes. |
 | `llm/` | FastAPI wrapper around Groq. Builds the prompt from `semantics.yaml`. |
-| `db/init/` | Schema and seed data, applied when the Postgres volume is first created. |
+| `api/migrations/` | The whole schema and starter habits, applied by the API at startup. |
 
 **Setting it up, using it, running it or fixing it?** See the
 [usage guide and SOP](docs/SOP.md), including how
@@ -48,9 +48,15 @@ under *Not included* with the reason, so you can send it on its own.
 original card stays approvable and you can simply try again. Every
 correction is recorded in the draft's `feedback_history`.
 
-**Units.** Names are normalized ("Mins" becomes minutes, "mi" becomes
-miles). Totals convert within a family (km and miles, minutes and hours,
-ml and liters), so "5 km" and "1 mile" add up in `/stats`.
+**Units.** The LLM decides the unit before anything is stored: it
+normalizes names ("mins" becomes minutes), reads ambiguous ones from the
+habit ("500 m" of running is meters, "30m" of meditation is minutes), and
+suggests one when you didn't say it, including a sensible default for a new
+habit (pushups become reps). The rules and examples are in the `units`
+section of `llm/semantics.yaml`. The API then re-checks every answer with
+the same rules (`api/app/units.py`) and shows the result on the card for
+you to approve. Totals convert within a family (km and miles, minutes and
+hours, ml and liters), so "5 km" and "1 mile" add up in `/stats`.
 
 **AI offline.** If the LLM is unreachable, simple messages about known
 habits ("ran 3 miles yesterday") and simple corrections ("6 km, not 4",
@@ -92,11 +98,21 @@ The interactive docs are at <http://localhost:8000/docs>.
 
 ### Schema changes
 
-`db/init/*.sql` is the baseline and only runs when the `pgdata` volume is
-empty. Later changes go in `api/migrations/NNNN_name.sql`. The API applies
-each file once, in order, at startup, and records it in
-`schema_migrations`, so an existing database is upgraded in place. Write
-migrations to be idempotent (`IF NOT EXISTS`).
+The whole schema lives in `api/migrations/`, starting with
+`0000_baseline.sql` and `0000_seed_habits.sql`. The API applies each file
+once, in order, at startup, and records it in `schema_migrations`. A fresh
+Postgres therefore needs nothing mounted, and an existing database
+(including one created by the old `db/init` scripts) is upgraded in place.
+New changes go in `api/migrations/NNNN_name.sql` and must be idempotent
+(`IF NOT EXISTS`); `api/tests/test_deploy.py` checks all three cases.
+
+### Docker images
+
+The compose file names the images `jackdiva/habitflow:api-<tag>`,
+`:llm-<tag>` and `:bot-<tag>` (override with `HABITFLOW_IMAGE` /
+`HABITFLOW_TAG`). See [docs/SOP.md](docs/SOP.md#publishing-to-docker-hub)
+for publishing them and deploying on a server with just the compose file
+and `.env`.
 
 ## Using the bot
 
@@ -139,7 +155,7 @@ ruff check .                                               # from repo root
 
 ### LLM evals
 
-`llm/evals/cases.yaml` holds 27 real phrases covering plain logs,
+`llm/evals/cases.yaml` holds 33 real phrases covering plain logs, units,
 relative dates, new habits, several habits in one message, and
 corrections, each with the expected intent. To score the real model
 (this makes one Groq request per case):

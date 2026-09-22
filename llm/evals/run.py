@@ -5,7 +5,7 @@ Score the real LLM against evals/cases.yaml.
     python -m evals.run --only "fix"                           # name filter
     python -m evals.run --min-pass 0.9                         # exit 1 below 90%
 
-This calls the model once per case (27 requests). It is not part of
+This calls the model once per case (33 requests). It is not part of
 the test suite; tests/test_evals.py checks the scorer offline.
 """
 
@@ -26,6 +26,7 @@ _UNIT_ALIASES = {
     "mile": "miles", "mi": "miles", "kms": "km", "kilometer": "km", "kilometers": "km",
     "k": "km", "min": "minutes", "mins": "minutes", "minute": "minutes",
     "hr": "hours", "hrs": "hours", "hour": "hours", "page": "pages", "glass": "glasses",
+    "m": "m", "meter": "meters", "metres": "meters", "lap": "laps", "rep": "reps",
     "concept": "concepts",
 }
 
@@ -78,6 +79,9 @@ def score(expect: dict, got: dict, ref: date) -> list[str]:
         check("amount", float(expect["amount"]), _num(got.get("amount")))
     if "metric" in expect:
         check("metric", _unit(expect["metric"]), _unit(got.get("metric")))
+    if "suggested_metric" in expect:
+        check("suggested_metric", _unit(expect["suggested_metric"]),
+              _unit(got.get("suggested_metric")))
     if "log_date" in expect:
         check("log_date", _resolve_date(expect["log_date"], ref), got.get("log_date"))
 

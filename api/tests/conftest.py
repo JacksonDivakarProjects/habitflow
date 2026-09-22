@@ -1,10 +1,10 @@
 """
 Test harness.
 
-Database: tests run against a throwaway `habitflow_test` database built from
-db/init/*.sql. The server comes from TEST_DATABASE_URL if set (e.g. the compose
-db), otherwise an embedded Postgres via `pgserver`. The real database is never
-touched.
+Database: tests run against a throwaway `habitflow_test` database built only
+by api/migrations, exactly as a fresh deployment is. The server comes from
+TEST_DATABASE_URL if set (e.g. the compose db), otherwise an embedded Postgres
+via `pgserver`. The real database is never touched.
 
 LLM: `app.drafting.call_llm` is replaced by FakeLLM, which returns queued
 responses so every flow is deterministic.
@@ -19,7 +19,8 @@ import psycopg
 import pytest
 from sqlalchemy.engine import make_url
 
-INIT_DIR = Path(__file__).resolve().parents[2] / "db" / "init"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
+SEED_SQL = MIGRATIONS_DIR / "0000_seed_habits.sql"
 TEST_DB = "habitflow_test"
 
 _pg_server = None  # keep the embedded server alive for the whole session
@@ -52,9 +53,6 @@ def pytest_configure(config):
         conn.execute(f"CREATE DATABASE {TEST_DB}")
 
     test_url = base.set(database=TEST_DB)
-    with psycopg.connect(_libpq(test_url)) as conn:
-        conn.execute((INIT_DIR / "01_schema.sql").read_text())
-
     # Must be set before `app` is imported: app.config reads it at import time.
     os.environ["DATABASE_URL"] = test_url.set(
         drivername="postgresql+psycopg"
@@ -73,7 +71,7 @@ def migrated():
 def clean_db(migrated):
     from app.db import engine
 
-    seed = (INIT_DIR / "02_seed.sql").read_text()
+    seed = SEED_SQL.read_text()
     with engine.begin() as conn:
         conn.exec_driver_sql(
             "TRUNCATE daily_logs, audit_log, habits, reminder_settings RESTART IDENTITY CASCADE"

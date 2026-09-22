@@ -75,8 +75,8 @@ intent_shape:
   habit_name: "string matching a known habit, or null"
   proposed_habit: "short lowercase snake_case name for a new habit, or null"
   amount: "positive number, or null"
-  metric: "lowercase string the user explicitly said, or null"
-  suggested_metric: "recommended unit when metric is null, or null"
+  metric: "the unit the user said, normalized to a preferred name (see UNITS), or null if they gave none"
+  suggested_metric: "when metric is null: the unit you recommend (see UNITS); otherwise null"
   log_date: "YYYY-MM-DD"
   confidence: "0.0 to 1.0"
   draft_sql: "a valid Postgres INSERT into daily_logs using :named placeholders for amount/metric/log_date"
@@ -88,9 +88,7 @@ intent_shape:
 rules:
   - "amount must be a positive number"
   - "log_date must be YYYY-MM-DD, never in the future"
-  - "metric: the unit the user EXPLICITLY mentioned, lowercase, or null"
-  - "units: use full plural names: miles, km, minutes, hours, pages, reps (not mi, mins, hrs)"
-  - "suggested_metric: when metric is null, your best guess based on habit default or recently used unit"
+  - "metric and suggested_metric follow the UNITS section below"
   - "if no known habit matches, propose a short lowercase snake_case name in proposed_habit"
   - "habit_name must match a name from KNOWN HABITS or be null"
   - "draft_sql: INSERT INTO daily_logs with a subquery to look up habit_id by name"
@@ -126,3 +124,24 @@ sql_examples:
       VALUES
         ((SELECT habit_id FROM habits WHERE name = 'running'), :amount, :metric, :log_date, 'llm'),
         ((SELECT habit_id FROM habits WHERE name = 'reading'), :amount_2, :metric_2, :log_date_2, 'llm')
+
+# ------------------------------------------------------------
+# Units: the LLM normalizes and suggests; the API re-checks.
+# ------------------------------------------------------------
+units:
+  preferred: [miles, km, meters, minutes, hours, seconds, pages, chapters, books,
+              reps, sets, steps, laps, glasses, liters, ml, calories, concepts]
+  rules:
+    - "metric is the unit the user SAID, written with a preferred name: mi/mile -> miles, k/kms/kilometres -> km, min/mins -> minutes, hr/hrs/h -> hours, pg/pgs -> pages"
+    - "a unit the user said that has no preferred name (e.g. \"burpees\") is kept as they wrote it, lowercase and plural"
+    - "read ambiguous abbreviations from the habit's default_metric: \"m\" is meters for a distance habit (miles, km) and minutes for a time habit (minutes, hours)"
+    - "never convert: keep the user's number with the user's unit (\"5 km\" stays 5 km even if the default is miles)"
+    - "when the user gave NO unit, metric is null and suggested_metric is the habit's default_metric, else its recently_used unit, else the most natural unit for the activity"
+    - "for a proposed_habit, always fill suggested_metric (or metric) with the most natural unit, since it becomes the new habit's default: pushups -> reps, water -> glasses, swimming -> laps, studying -> hours"
+  examples:
+    - {text: "ran 500 m", habit_default: miles, metric: meters, suggested_metric: null}
+    - {text: "meditated 30m", habit_default: minutes, metric: minutes, suggested_metric: null}
+    - {text: "ran 5k", habit_default: miles, metric: km, suggested_metric: null}
+    - {text: "read 20", habit_default: pages, metric: null, suggested_metric: pages}
+    - {text: "did 20 pushups", habit_default: "(new habit)", metric: null, suggested_metric: reps}
+    - {text: "drank 8 glasses of water", habit_default: "(new habit)", metric: glasses, suggested_metric: null}

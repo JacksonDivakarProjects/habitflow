@@ -155,5 +155,11 @@ def test_system_prompt_explains_multi_habit_messages():
     assert ":amount_2" in prompt  # the multi-row SQL example
 
 
-def test_system_prompt_asks_for_canonical_units():
-    assert "full plural names" in client._build_system_prompt(HABITS)
+def test_system_prompt_gives_llm_the_unit_decisions():
+    prompt = client._build_system_prompt(HABITS)
+
+    assert "UNITS:" in prompt
+    assert "Preferred unit names: miles, km, meters, minutes" in prompt
+    assert '"ran 500 m" (habit default: miles) -> metric: meters' in prompt
+    assert '"did 20 pushups" (habit default: (new habit)) -> metric: null, suggested_metric: reps' in prompt
+    assert "never convert" in prompt

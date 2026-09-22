@@ -57,6 +57,19 @@ def _build_system_prompt(habits: list[dict]) -> str:
         for ex in sql_examples
     )
 
+    units = SEMANTICS.get("units", {})
+    units_str = "\n".join(
+        [f"Preferred unit names: {', '.join(units.get('preferred', []))}"]
+        + [f"- {r}" for r in units.get("rules", [])]
+        + ["Examples:"]
+        + [
+            f"  \"{ex['text']}\" (habit default: {ex['habit_default']}) -> "
+            f"metric: {ex['metric'] or 'null'}, "
+            f"suggested_metric: {ex['suggested_metric'] or 'null'}"
+            for ex in units.get("examples", [])
+        ]
+    )
+
     shape = json.dumps(SEMANTICS.get("intent_shape", {}), indent=2)
     local_today = datetime.now(ZoneInfo(settings.app_timezone)).date()
     today = local_today.isoformat()
@@ -75,6 +88,9 @@ KNOWN HABITS (the ONLY valid values for habit_name):
 
 RULES:
 {rules_str}
+
+UNITS:
+{units_str}
 
 SQL EXAMPLES:
 {sql_examples_str}

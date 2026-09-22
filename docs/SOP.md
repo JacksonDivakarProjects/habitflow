@@ -266,7 +266,7 @@ Edit correction made to it.
 1. **Branch:** `git switch -c my-change`.
 2. **Change the code.**
    - **Database schema:** add `api/migrations/NNNN_name.sql` (next number,
-     idempotent `IF NOT EXISTS`). Don't edit `db/init/` for existing installs.
+     idempotent `IF NOT EXISTS`). The API applies it at startup everywhere.
    - **LLM behaviour:** edit `llm/semantics.yaml`. The API tests fail if a
      SQL example there wouldn't pass the SQL guard.
 3. **Test everything.** This needs no Docker: the tests start a throwaway
@@ -280,11 +280,47 @@ Edit correction made to it.
    ```bash
    cd llm && GROQ_API_KEY=... python -m evals.run --min-pass 0.9
    ```
-   This makes 27 Groq requests. It shows each failing case and which fields
+   This makes 33 Groq requests. It shows each failing case and which fields
    were missed.
 5. **Push and open a PR.** CI runs lint plus the api, llm, bot and e2e
    suites. Merge only when it's green.
-6. **Deploy:** on the machine running the bot, `git pull && docker compose up -d --build`.
+6. **Deploy:** on the machine running the bot, `git pull && docker compose up -d --build`,
+   or publish images and pull them (next section).
+
+### Publishing to Docker Hub
+
+The compose file tags the images `jackdiva/habitflow:api-<tag>`,
+`:llm-<tag>` and `:bot-<tag>` (defaults: `HABITFLOW_IMAGE=jackdiva/habitflow`,
+`HABITFLOW_TAG=latest`).
+
+**On your build machine (from the repo):**
+
+```bash
+docker login                                   # as jackdiva
+export HABITFLOW_TAG=1.0.0                     # a version; also push "latest" if you like
+docker compose build
+docker compose push api llm bot                # db is the official postgres image
+docker compose publish jackdiva/habitflow:compose-$HABITFLOW_TAG   # optional: the compose file itself
+```
+
+**On a server (no source code needed):**
+
+```bash
+mkdir habitflow && cd habitflow
+# either copy docker-compose.yml here, or run it straight from Docker Hub:
+#   docker compose -f oci://docker.io/jackdiva/habitflow:compose-1.0.0 ...
+nano .env && chmod 600 .env                     # same variables as .env.example
+echo HABITFLOW_TAG=1.0.0 >> .env                # pin the release you pushed
+docker compose pull
+docker compose up -d
+```
+
+The database schema is created by the API on first start; nothing else is
+mounted. Upgrading is `HABITFLOW_TAG=<new>` in `.env`, then `docker compose
+pull && docker compose up -d`. Your data stays in the `habitflow_pgdata`
+volume. The images are built for the architecture of the machine that built
+them (usually `amd64`); for an ARM server build with
+`docker buildx build --platform linux/arm64` or use a matching machine.
 
 ---
 

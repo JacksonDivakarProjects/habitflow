@@ -8,7 +8,7 @@ from evals.run import _resolve_date, load_cases, report, run_cases, score
 
 REF = date(2026, 9, 23)
 KNOWN_FIELDS = {
-    "habit_name", "proposed_habit", "amount", "metric", "log_date",
+    "habit_name", "proposed_habit", "amount", "metric", "suggested_metric", "log_date",
     "extra_logs", "extra_logs_count",
 }
 
@@ -90,7 +90,8 @@ def test_run_cases_with_a_perfect_model(data):
     by_text = {}
     for case in data["cases"]:
         e = case["expect"]
-        answer = {k: e[k] for k in ("habit_name", "proposed_habit", "amount", "metric") if k in e}
+        answer = {k: e[k] for k in ("habit_name", "proposed_habit", "amount", "metric",
+                                    "suggested_metric") if k in e}
         if "log_date" in e:
             answer["log_date"] = _resolve_date(e["log_date"], REF)
         n = e.get("extra_logs_count", len(e.get("extra_logs", [])))
@@ -125,3 +126,16 @@ def test_correction_cases_pass_the_draft_and_resolve_its_dates(data):
     assert seen[0]["original_text"] == "read 20 pages"
     assert seen[0]["clarification"] == "it was yesterday"
     assert seen[0]["current_draft"]["log_date"] == "2026-09-23"
+
+
+def test_score_suggested_metric():
+    assert score({"suggested_metric": "reps"}, {"metric": None, "suggested_metric": "rep"}, REF) == []
+    assert score({"suggested_metric": "reps"}, {"suggested_metric": None}, REF) == [
+        "suggested_metric: want 'reps', got None"
+    ]
+
+
+def test_case_file_covers_unit_decisions(data):
+    names = {c["name"] for c in data["cases"]}
+    assert {"m is meters for a run", "m is minutes for meditation", "no conversion",
+            "new habit gets natural unit"} <= names

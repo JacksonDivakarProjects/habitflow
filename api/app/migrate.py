@@ -1,10 +1,11 @@
 """
 Minimal forward-only migrations.
 
-db/init/*.sql is the baseline and only runs on an empty volume. Changes after
-that go in api/migrations/NNNN_name.sql; each file is applied once, in order,
-at API startup, and recorded in schema_migrations. Write them idempotently
-(IF NOT EXISTS) so a fresh database and an upgraded one end up the same.
+The whole schema lives in api/migrations/NNNN_name.sql, starting with
+0000_baseline.sql, so an empty Postgres needs nothing mounted. Each file is
+applied once, in order, at API startup, and recorded in schema_migrations.
+Write them idempotently (IF NOT EXISTS) so a fresh database, one created by
+the old db/init, and an upgraded one all end up the same.
 """
 
 import logging
