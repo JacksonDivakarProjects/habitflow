@@ -26,8 +26,8 @@ class FakeAPI:
         self.requests: list[httpx.Request] = []
         self.timeouts: dict[str, object] = {}
 
-    def on(self, method: str, path: str, status: int = 200, json=None):
-        self.routes[(method, path)] = (status, json)
+    def on(self, method: str, path: str, status: int = 200, json=None, raises=None):
+        self.routes[(method, path)] = (status, raises or json)
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -35,6 +35,8 @@ class FakeAPI:
         if key not in self.routes:
             raise AssertionError(f"unexpected API call: {key}")
         status, body = self.routes[key]
+        if isinstance(body, Exception):
+            raise body
         return httpx.Response(status, json=body)
 
     def client(self, timeout=None, **kwargs):
@@ -73,7 +75,7 @@ def make_update(text=None, user_id=ALLOWED_USER, message_id=10, callback_data=No
             data=callback_data,
             answer=AsyncMock(),
             edit_message_text=AsyncMock(),
-            message=SimpleNamespace(message_id=message_id),
+            message=SimpleNamespace(message_id=message_id, text="📝 4 miles of Running today"),
         )
     return SimpleNamespace(
         effective_user=SimpleNamespace(id=user_id),
@@ -86,9 +88,18 @@ def make_update(text=None, user_id=ALLOWED_USER, message_id=10, callback_data=No
 def make_context(**user_data):
     return SimpleNamespace(
         user_data=dict(user_data),
-        bot=SimpleNamespace(edit_message_text=AsyncMock()),
+        bot=SimpleNamespace(edit_message_text=AsyncMock(), send_chat_action=AsyncMock()),
     )
 
 
 def replies(update) -> list[str]:
     return [c.args[0] for c in update.message.reply_text.await_args_list]
+
+
+def edited(update) -> str:
+    return update.callback_query.edit_message_text.await_args.args[0]
+
+
+def popup(update) -> str | None:
+    call = update.callback_query.answer.await_args
+    return call.args[0] if call.args and call.kwargs.get("show_alert") else None

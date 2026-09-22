@@ -3,7 +3,6 @@
 from sqlalchemy import select
 
 from app.models import AuditLog, DailyLog, Habit
-from app.timeutil import today
 
 CHAT = 1001
 
@@ -35,7 +34,7 @@ def test_draft_then_execute_writes_log(client, db, fake_llm, make_intent):
     r = _draft(client)
     assert r.status_code == 200
     body = r.json()
-    assert body["preview"] == f"4 miles of Running on {today().isoformat()}"
+    assert body["preview"] == "4 miles of Running today"
     assert body["metric_source"] == "explicit"
     assert "INSERT INTO daily_logs" in body["draft_sql"]
 
@@ -57,7 +56,7 @@ def test_execute_is_idempotent(client, db, fake_llm, make_intent):
     client.post("/internal/execute", json={"audit_id": audit_id})
     r = client.post("/internal/execute", json={"audit_id": audit_id})
 
-    assert r.json() == {"status": "already_executed", "log_id": None}
+    assert r.json() == {"status": "already_executed", "log_id": 1, "summary": None}
     assert len(db.execute(select(DailyLog)).scalars().all()) == 1
 
 
@@ -110,7 +109,9 @@ def test_new_habit_proposal_approved_then_executed(client, db, fake_llm, make_in
     )
     body = _draft(client, "learned rust for 4 hours").json()
     assert body["needs_input"] == "habit"
-    assert "learning_rust" in body["prompt"]
+    assert body["prompt"] == (
+        "“Learning Rust” is a new habit. Create it and log 4 hours today?"
+    )
 
     r = client.post(
         "/internal/approve_habit", json={"audit_id": body["audit_id"], "accept": True}
@@ -216,10 +217,10 @@ def test_feedback_on_executed_audit_is_409(client, fake_llm, make_intent):
     assert r.status_code == 409
 
 
-def test_llm_down_returns_422_after_retries(client, db, fake_llm):
+def test_llm_down_and_unparseable_returns_422(client, db, fake_llm):
     fake_llm.queue(*[RuntimeError("groq down")] * 3)
 
-    r = _draft(client)
+    r = _draft(client, "did the thing")
 
     assert r.status_code == 422
     assert "failed after 3 attempts" in r.json()["detail"]
@@ -255,4 +256,6 @@ def test_stats_sums_last_30_days(client, fake_llm, make_intent):
 
     rows = client.get("/internal/stats", params={"chat_id": CHAT}).json()
 
-    assert rows == [{"habit": "Running", "metric": "miles", "total": 6.0, "days": 1}]
+    assert rows == [
+        {"habit": "Running", "metric": "miles", "total": 6.0, "days": 1, "streak_days": 1}
+    ]

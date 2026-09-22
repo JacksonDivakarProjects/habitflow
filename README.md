@@ -27,10 +27,17 @@ Telegram ──> bot ──HTTP──> api ──HTTP──> llm ──> Groq (L
    is sent back to the LLM and it tries again, up to 3 attempts.
 2. **Fill gaps.** If the unit is missing, the bot asks for one. If the habit is
    unknown, the bot offers to create it.
-3. **Review.** You get a card showing the preview and the SQL. **✏️ Feedback**
-   regenerates the draft in place (Loop 2). **✅ Approve** writes it.
+3. **Review.** You get a card showing the preview and the SQL. **✏️ Edit**
+   lets you reply with a correction and regenerates the draft in place
+   (Loop 2). **🗑️ Discard** drops it. **✅ Approve** writes it.
 4. **Execute.** `api` builds its own parameterized `INSERT` from the validated
    fields. The LLM's SQL is only shown and dry-run checked, never executed.
+   The confirmation shows your streak and weekly total, plus a **↩️ Undo**
+   button.
+
+If the LLM is unreachable, simple messages about known habits ("ran 3 miles
+yesterday") still work. They are read by a regex parser (`api/app/parser.py`),
+and the card is marked *AI is offline* so you know to check it.
 
 Every step is recorded in `audit_log`. Its `status` column moves through
 `pending` / `awaiting_input` → `executed` | `failed` | `cancelled` |
@@ -65,20 +72,30 @@ docker compose logs -f bot
 The API is published on `127.0.0.1:8000` only; `/internal/*` has no auth.
 The interactive docs are at <http://localhost:8000/docs>.
 
-> **Schema changes:** `db/init/*.sql` runs only when the `pgdata` volume is
-> empty. To re-initialize (this **deletes all data**):
-> `docker compose down -v && docker compose up -d`.
+### Schema changes
+
+`db/init/*.sql` is the baseline and only runs when the `pgdata` volume is
+empty. Later changes go in `api/migrations/NNNN_name.sql`. The API applies
+each file once, in order, at startup, and records it in
+`schema_migrations`, so an existing database is upgraded in place. Write
+migrations to be idempotent (`IF NOT EXISTS`).
 
 ## Using the bot
 
 | Send | Result |
 |---|---|
-| `ran 4 miles today` | Card: *4 miles of Running on …* → Approve |
-| `read 20` | Uses the default unit (pages), marked *(suggested)* |
-| `learned rust for 2 hours` | Offers to create a *Learning Rust* habit |
+| `ran 4 miles` | Card: *4 miles of Running today* → ✅ → *🔥 3-day streak · 12 miles this week* |
+| `read 20` | Uses the default unit (pages), marked *(suggested unit)* |
+| `learned rust for 2 hours` | Offers to create a *Learning Rust* habit (and asks for a unit if it can't tell) |
+| `/today` | What you've logged today |
+| `/stats` | Totals and streaks for the last 30 days |
+| `/undo` | Void your most recent log (it stays in the audit trail) |
 | `/habits` | Tracked habits and their default units |
-| `/stats` | Totals for the last 30 days |
-| `/cancel` | Drop an open unit question or feedback prompt |
+| `/cancel` | Drop an open unit question or edit |
+
+Errors are shown in plain language, for example "This draft was replaced by
+a newer one." Errors from a button press appear as a popup, so the card
+stays as it was.
 
 ## Tests
 

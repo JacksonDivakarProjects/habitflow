@@ -1,16 +1,21 @@
 import time
+from datetime import timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app import drafting
 from app.db import get_db
 from app.drafting import regenerate_from_feedback, run_loop1
 from app.models import AuditLog, DailyLog, Habit
+from app.progress import log_summary, streak_days
+from app.timeutil import friendly_date, today
 
 router = APIRouter(prefix="/internal", tags=["internal"])
+
+OPEN_STATUSES = ("pending", "awaiting_input")
 
 
 def _record_duration(audit: AuditLog, started: float, db: Session):
@@ -18,6 +23,23 @@ def _record_duration(audit: AuditLog, started: float, db: Session):
     audit.duration_ms = int((time.monotonic() - started) * 1000)
     db.commit()
     db.refresh(audit)
+
+
+def _lock_audit(db: Session, audit_id: int) -> AuditLog:
+    audit = db.execute(
+        select(AuditLog).where(AuditLog.audit_id == audit_id).with_for_update()
+    ).scalar_one_or_none()
+    if audit is None:
+        raise HTTPException(status_code=404, detail="Audit not found")
+    return audit
+
+
+def _status_conflict(audit: AuditLog) -> HTTPException:
+    return HTTPException(status_code=409, detail=f"Audit status is {audit.status}")
+
+
+def _preview(amount, metric, display_name: str, log_date) -> str:
+    return f"{float(amount):g} {metric} of {display_name} {friendly_date(log_date)}"
 
 
 # ------------------------------------------------------------------
@@ -58,6 +80,40 @@ class DraftResponse(BaseModel):
     needs_input: str | None = None
     prompt: str | None = None
     metric_source: str | None = None
+    offline: bool = False  # drafted by the regex fallback, LLM unavailable
+
+
+def _card(audit: AuditLog, db: Session) -> DraftResponse:
+    """Response for an audit that is pending approval."""
+    intent = audit.intent
+    habit = db.get(Habit, intent["habit_id"])
+    return DraftResponse(
+        audit_id=audit.audit_id,
+        preview=_preview(intent["amount"], intent["metric"], habit.display_name,
+                         intent["log_date"]),
+        intent=intent,
+        draft_sql=audit.draft_sql,
+        metric_source=intent.get("metric_source", "explicit"),
+        offline=intent.get("parser") == "offline",
+    )
+
+
+def _loop_response(
+    audit: AuditLog, clarify_prompt, proposal_prompt, db: Session, failure: str
+) -> DraftResponse:
+    if clarify_prompt:
+        return DraftResponse(
+            audit_id=audit.audit_id, needs_input="unit", prompt=clarify_prompt,
+            draft_sql=audit.draft_sql,
+        )
+    if proposal_prompt:
+        return DraftResponse(
+            audit_id=audit.audit_id, needs_input="habit", prompt=proposal_prompt,
+            draft_sql=audit.draft_sql,
+        )
+    if audit.status == "failed":
+        raise HTTPException(status_code=422, detail=audit.error_message or failure)
+    return _card(audit, db)
 
 
 @router.post("/draft", response_model=DraftResponse)
@@ -66,39 +122,8 @@ def draft(req: DraftRequest, db: Session = Depends(get_db)):
     audit, clarify_prompt, proposal_prompt = run_loop1(req.text, req.chat_id, db)
     audit.message_id = req.message_id
     _record_duration(audit, started, db)
-
-    if clarify_prompt:
-        return DraftResponse(
-            audit_id=audit.audit_id,
-            needs_input="unit",
-            prompt=clarify_prompt,
-            draft_sql=audit.draft_sql,
-        )
-    if proposal_prompt:
-        return DraftResponse(
-            audit_id=audit.audit_id,
-            needs_input="habit",
-            prompt=proposal_prompt,
-            draft_sql=audit.draft_sql,
-        )
-    if audit.status == "failed":
-        raise HTTPException(
-            status_code=422,
-            detail=audit.error_message or "Couldn't understand that.",
-        )
-
-    habit = db.get(Habit, audit.intent["habit_id"])
-    source = audit.intent.get("metric_source", "explicit")
-    preview = (
-        f"{audit.intent['amount']:g} {audit.intent['metric']} of "
-        f"{habit.display_name} on {audit.intent['log_date']}"
-    )
-    return DraftResponse(
-        audit_id=audit.audit_id,
-        preview=preview,
-        intent=audit.intent,
-        draft_sql=audit.draft_sql,
-        metric_source=source,
+    return _loop_response(
+        audit, clarify_prompt, proposal_prompt, db, "Couldn't understand that."
     )
 
 
@@ -112,18 +137,9 @@ class ClarifyRequest(BaseModel):
 
 @router.post("/clarify", response_model=DraftResponse)
 def clarify(req: ClarifyRequest, db: Session = Depends(get_db)):
-    audit = (
-        db.execute(
-            select(AuditLog)
-            .where(AuditLog.audit_id == req.audit_id)
-            .with_for_update()
-        )
-        .scalar_one_or_none()
-    )
-    if audit is None:
-        raise HTTPException(status_code=404, detail="Audit not found")
+    audit = _lock_audit(db, req.audit_id)
     if audit.status != "awaiting_input":
-        raise HTTPException(status_code=409, detail=f"Status is {audit.status}")
+        raise _status_conflict(audit)
 
     intent = dict(audit.intent or {})
     if intent.get("needs") != "unit":
@@ -136,15 +152,18 @@ def clarify(req: ClarifyRequest, db: Session = Depends(get_db)):
             current_draft=drafting.llm_view(intent),
             habits=drafting.habits_context(db),
         )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM call failed: {e}") from e
+        metric = new_intent.get("metric") or new_intent.get("suggested_metric")
+    except Exception:
+        # LLM unavailable: a bare unit ("km") is still usable as typed.
+        new_intent = {}
+        words = req.value.strip().lower().split()
+        metric = words[0] if len(words) == 1 and words[0].isalpha() else None
 
-    metric = new_intent.get("metric") or new_intent.get("suggested_metric")
     if not metric:
         return DraftResponse(
             audit_id=audit.audit_id,
             needs_input="unit",
-            prompt=f"Still need a unit for '{req.value}'. Try again.",
+            prompt=f"Sorry, I didn't catch a unit in “{req.value}”. Try e.g. “km” or “minutes”.",
             draft_sql=audit.draft_sql,
         )
 
@@ -160,19 +179,7 @@ def clarify(req: ClarifyRequest, db: Session = Depends(get_db)):
     audit.status = "pending"
     db.commit()
     db.refresh(audit)
-
-    habit = db.get(Habit, intent["habit_id"])
-    preview = (
-        f"{intent['amount']:g} {intent['metric']} of "
-        f"{habit.display_name} on {intent['log_date']}"
-    )
-    return DraftResponse(
-        audit_id=audit.audit_id,
-        preview=preview,
-        intent=intent,
-        draft_sql=audit.draft_sql,
-        metric_source="explicit",
-    )
+    return _card(audit, db)
 
 
 # ------------------------------------------------------------------
@@ -185,18 +192,9 @@ class ApproveHabitRequest(BaseModel):
 
 @router.post("/approve_habit", response_model=DraftResponse)
 def approve_habit(req: ApproveHabitRequest, db: Session = Depends(get_db)):
-    audit = (
-        db.execute(
-            select(AuditLog)
-            .where(AuditLog.audit_id == req.audit_id)
-            .with_for_update()
-        )
-        .scalar_one_or_none()
-    )
-    if audit is None:
-        raise HTTPException(status_code=404, detail="Audit not found")
+    audit = _lock_audit(db, req.audit_id)
     if audit.status != "awaiting_input":
-        raise HTTPException(status_code=409, detail=f"Status is {audit.status}")
+        raise _status_conflict(audit)
 
     intent = dict(audit.intent or {})
     if intent.get("needs") != "habit_approval":
@@ -212,13 +210,11 @@ def approve_habit(req: ApproveHabitRequest, db: Session = Depends(get_db)):
     name = intent["proposed_habit"]
     default_metric = intent.get("metric") or intent.get("suggested_metric")
 
-    existing = db.execute(select(Habit).where(Habit.name == name)).scalar_one_or_none()
-    if existing:
-        habit = existing
-    else:
+    habit = db.execute(select(Habit).where(Habit.name == name)).scalar_one_or_none()
+    if habit is None:
         habit = Habit(
             name=name,
-            display_name=name.replace("_", " ").title(),
+            display_name=drafting.habit_display_name(name),
             metric=default_metric,
         )
         db.add(habit)
@@ -229,10 +225,7 @@ def approve_habit(req: ApproveHabitRequest, db: Session = Depends(get_db)):
     intent.pop("proposed_habit", None)
     intent.pop("needs", None)
 
-    metric = default_metric
-    source = "suggested" if default_metric else "missing"
-
-    if metric is None:
+    if default_metric is None:
         intent["needs"] = "unit"
         audit.intent = intent
         audit.status = "awaiting_input"
@@ -242,57 +235,60 @@ def approve_habit(req: ApproveHabitRequest, db: Session = Depends(get_db)):
             audit_id=audit.audit_id,
             needs_input="unit",
             prompt=(
-                f"Created '{habit.display_name}'. What unit for "
-                f"{intent['amount']:g} on {intent['log_date']}?"
+                f"Created {habit.display_name}. What unit is the "
+                f"{intent['amount']:g} {friendly_date(intent['log_date'])}? "
+                f"(e.g. reps, minutes, pages)"
             ),
             draft_sql=audit.draft_sql,
         )
 
-    intent["metric"] = metric
-    intent["metric_source"] = source
+    intent["metric"] = default_metric
+    intent["metric_source"] = "suggested"
     drafting.supersede_pending(audit.chat_id, db, keep_audit_id=audit.audit_id)
     audit.intent = intent
     audit.status = "pending"
     db.commit()
     db.refresh(audit)
+    return _card(audit, db)
 
-    preview = (
-        f"{intent['amount']:g} {intent['metric']} of "
-        f"{habit.display_name} on {intent['log_date']}"
-    )
-    return DraftResponse(
-        audit_id=audit.audit_id,
-        preview=preview,
-        intent=intent,
-        draft_sql=audit.draft_sql,
-        metric_source=source,
-    )
+
+# ------------------------------------------------------------------
+# /discard — drop an open draft
+# ------------------------------------------------------------------
+class AuditRequest(BaseModel):
+    audit_id: int
+
+
+@router.post("/discard")
+def discard(req: AuditRequest, db: Session = Depends(get_db)):
+    audit = _lock_audit(db, req.audit_id)
+    if audit.status == "cancelled":
+        return {"status": "already_discarded"}
+    if audit.status not in OPEN_STATUSES:
+        raise _status_conflict(audit)
+    audit.status = "cancelled"
+    db.commit()
+    return {"status": "discarded"}
 
 
 # ------------------------------------------------------------------
 # /execute
 # ------------------------------------------------------------------
-class ExecuteRequest(BaseModel):
-    audit_id: int
-
-
 @router.post("/execute")
-def execute(req: ExecuteRequest, db: Session = Depends(get_db)):
-    audit = (
-        db.execute(
-            select(AuditLog)
-            .where(AuditLog.audit_id == req.audit_id)
-            .with_for_update()
-        )
-        .scalar_one_or_none()
-    )
-    if audit is None:
-        raise HTTPException(status_code=404, detail="Audit not found")
+def execute(req: AuditRequest, db: Session = Depends(get_db)):
+    audit = _lock_audit(db, req.audit_id)
 
     if audit.status == "executed":
-        return {"status": "already_executed", "log_id": None}
+        log = db.execute(
+            select(DailyLog).where(DailyLog.audit_id == audit.audit_id)
+        ).scalar_one_or_none()
+        return {
+            "status": "already_executed",
+            "log_id": log.log_id if log else None,
+            "summary": None,
+        }
     if audit.status != "pending":
-        raise HTTPException(status_code=409, detail=f"Audit status is {audit.status}")
+        raise _status_conflict(audit)
 
     intent = audit.intent or {}
     habit_id = intent.get("habit_id")
@@ -325,8 +321,38 @@ def execute(req: ExecuteRequest, db: Session = Depends(get_db)):
         "VALUES (:habit_id, :amount, :metric, :log_date, 'llm', :audit_id)"
     )
     db.commit()
+    db.refresh(log)
 
-    return {"status": "executed", "log_id": log.log_id}
+    habit = db.get(Habit, habit_id)
+    return {"status": "executed", "log_id": log.log_id, "summary": log_summary(db, log, habit)}
+
+
+# ------------------------------------------------------------------
+# /undo — void a log (kept for audit, excluded everywhere else)
+# ------------------------------------------------------------------
+class UndoRequest(BaseModel):
+    log_id: int | None = None  # None: the most recent live log
+
+
+@router.post("/undo")
+def undo(req: UndoRequest, db: Session = Depends(get_db)):
+    query = select(DailyLog).with_for_update()
+    if req.log_id is not None:
+        query = query.where(DailyLog.log_id == req.log_id)
+    else:
+        query = query.where(DailyLog.voided_at.is_(None)).order_by(DailyLog.log_id.desc())
+    log = db.execute(query.limit(1)).scalar_one_or_none()
+    if log is None:
+        raise HTTPException(status_code=404, detail="Nothing to undo")
+
+    habit = db.get(Habit, log.habit_id)
+    preview = _preview(log.amount, log.metric, habit.display_name, log.log_date)
+    if log.voided_at is not None:
+        return {"status": "already_undone", "log_id": log.log_id, "preview": preview}
+
+    log.voided_at = func.now()
+    db.commit()
+    return {"status": "undone", "log_id": log.log_id, "preview": preview}
 
 
 # ------------------------------------------------------------------
@@ -339,60 +365,44 @@ class FeedbackRequest(BaseModel):
 
 @router.post("/feedback", response_model=DraftResponse)
 def feedback(req: FeedbackRequest, db: Session = Depends(get_db)):
-    audit = (
-        db.execute(
-            select(AuditLog)
-            .where(AuditLog.audit_id == req.audit_id)
-            .with_for_update()
-        )
-        .scalar_one_or_none()
-    )
-    if audit is None:
-        raise HTTPException(status_code=404, detail="Audit not found")
-    if audit.status not in ("pending", "awaiting_input"):
-        raise HTTPException(
-            status_code=409, detail=f"Audit status is {audit.status}"
-        )
+    audit = _lock_audit(db, req.audit_id)
+    if audit.status not in OPEN_STATUSES:
+        raise _status_conflict(audit)
 
     started = time.monotonic()
     audit, clarify_prompt, proposal_prompt = regenerate_from_feedback(
         audit, req.feedback, db
     )
     _record_duration(audit, started, db)
-
-    if clarify_prompt:
-        return DraftResponse(
-            audit_id=audit.audit_id,
-            needs_input="unit",
-            prompt=clarify_prompt,
-            draft_sql=audit.draft_sql,
-        )
-    if proposal_prompt:
-        return DraftResponse(
-            audit_id=audit.audit_id,
-            needs_input="habit",
-            prompt=proposal_prompt,
-            draft_sql=audit.draft_sql,
-        )
-    if audit.status == "failed":
-        raise HTTPException(
-            status_code=422,
-            detail=audit.error_message or "Couldn't regenerate from feedback.",
-        )
-
-    habit = db.get(Habit, audit.intent["habit_id"])
-    source = audit.intent.get("metric_source", "explicit")
-    preview = (
-        f"{audit.intent['amount']:g} {audit.intent['metric']} of "
-        f"{habit.display_name} on {audit.intent['log_date']}"
+    return _loop_response(
+        audit, clarify_prompt, proposal_prompt, db, "Couldn't regenerate from feedback."
     )
-    return DraftResponse(
-        audit_id=audit.audit_id,
-        preview=preview,
-        intent=audit.intent,
-        draft_sql=audit.draft_sql,
-        metric_source=source,
-    )
+
+
+# ------------------------------------------------------------------
+# /today
+# ------------------------------------------------------------------
+@router.get("/today")
+def today_logs(db: Session = Depends(get_db)):
+    day = today()
+    rows = db.execute(
+        select(DailyLog, Habit.display_name)
+        .join(Habit, Habit.habit_id == DailyLog.habit_id)
+        .where(DailyLog.log_date == day, DailyLog.voided_at.is_(None))
+        .order_by(DailyLog.log_id)
+    ).all()
+    return {
+        "date": day.isoformat(),
+        "logs": [
+            {
+                "log_id": log.log_id,
+                "habit": name,
+                "amount": float(log.amount),
+                "metric": log.metric,
+            }
+            for log, name in rows
+        ],
+    }
 
 
 # ------------------------------------------------------------------
@@ -400,27 +410,33 @@ def feedback(req: FeedbackRequest, db: Session = Depends(get_db)):
 # ------------------------------------------------------------------
 @router.get("/stats")
 def stats(chat_id: int, db: Session = Depends(get_db)):
+    since = today() - timedelta(days=29)  # 30 days including today
     rows = db.execute(
         text(
             """
-            SELECT h.display_name,
+            SELECT h.habit_id,
+                   h.display_name,
                    dl.metric,
                    SUM(dl.amount) AS total,
                    COUNT(DISTINCT dl.log_date) AS days
             FROM daily_logs dl
             JOIN habits h USING (habit_id)
-            WHERE dl.log_date >= CURRENT_DATE - INTERVAL '30 days'
-            GROUP BY h.display_name, dl.metric
+            WHERE dl.log_date >= :since
+              AND dl.voided_at IS NULL
+            GROUP BY h.habit_id, h.display_name, dl.metric
             ORDER BY h.display_name, dl.metric
             """
-        )
+        ),
+        {"since": since},
     ).all()
+    streaks = {hid: streak_days(db, hid) for hid in {r.habit_id for r in rows}}
     return [
         {
             "habit": r.display_name,
             "metric": r.metric,
             "total": float(r.total),
             "days": r.days,
+            "streak_days": streaks[r.habit_id],
         }
         for r in rows
     ]

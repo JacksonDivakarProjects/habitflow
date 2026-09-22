@@ -1,8 +1,10 @@
 import re
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import timedelta
 from decimal import Decimal
 from typing import Optional
+
+from app.timeutil import today
 
 
 @dataclass
@@ -77,7 +79,7 @@ def parse_text(text: str) -> Optional[ParsedIntent]:
             break
 
     # 4. Find date
-    log_date = date.today()
+    log_date = today()
     if "yesterday" in lowered:
         log_date = log_date - timedelta(days=1)
     elif "tomorrow" in lowered:

@@ -8,8 +8,9 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import AuditLog, Habit
+from app.parser import parse_text
 from app.sqlguard import bind_nulls, check_draft_sql
-from app.timeutil import today
+from app.timeutil import friendly_date, today
 
 
 def habits_context(db: Session) -> list[dict]:
@@ -19,6 +20,7 @@ def habits_context(db: Session) -> list[dict]:
             """
             SELECT DISTINCT ON (habit_id) habit_id, metric
             FROM daily_logs
+            WHERE voided_at IS NULL
             ORDER BY habit_id, log_date DESC, log_id DESC
             """
         )
@@ -152,6 +154,53 @@ def supersede_pending(chat_id: int, db: Session, keep_audit_id: Optional[int] = 
     db.execute(stmt.values(status="superseded"))
 
 
+def habit_display_name(name: str) -> str:
+    return name.replace("_", " ").title()
+
+
+def proposal_prompt(intent: dict, metric: Optional[str]) -> str:
+    what = f"{intent['amount']:g} {metric}" if metric else f"{intent['amount']:g}"
+    when = friendly_date(intent["log_date"])
+    follow_up = "" if metric else " I'll ask for the unit next."
+    return (
+        f"“{habit_display_name(intent['proposed_habit'])}” is a new habit. "
+        f"Create it and log {what} {when}?{follow_up}"
+    )
+
+
+def unit_prompt(intent: dict, habit: Habit) -> str:
+    example = habit.metric or "minutes, pages, km"
+    return (
+        f"Got it: {intent['amount']:g} of {habit.display_name} "
+        f"{friendly_date(intent['log_date'])}. What unit? (e.g. {example})"
+    )
+
+
+def offline_intent(user_text: str, habits: list[dict]) -> Optional[dict]:
+    """Regex fallback for when the LLM is unreachable. Known habits only."""
+    parsed = parse_text(user_text)
+    if parsed is None:
+        return None
+    default = next(
+        (h["default_metric"] for h in habits if h["name"] == parsed.habit_name), None
+    )
+    return {
+        "habit_name": parsed.habit_name,
+        "proposed_habit": None,
+        "amount": float(parsed.amount),
+        "metric": parsed.metric,
+        "suggested_metric": None if parsed.metric else default,
+        "log_date": parsed.log_date,
+        "confidence": parsed.confidence,
+        "draft_sql": (
+            "INSERT INTO daily_logs (habit_id, amount, metric, log_date, source)\n"
+            f"VALUES ((SELECT habit_id FROM habits WHERE name = '{parsed.habit_name}'),\n"
+            "        :amount, :metric, :log_date, 'llm')"
+        ),
+        "parser": "offline",
+    }
+
+
 def _resolve_metric(intent: dict) -> tuple[Optional[str], str]:
     if intent.get("metric"):
         return intent["metric"], "explicit"
@@ -183,8 +232,9 @@ def run_loop1(
             )
         except Exception as e:
             error = f"LLM call failed: {e}"
-            intent = None
-            continue
+            intent = offline_intent(user_text, habits)
+            if intent is None:
+                continue
 
         is_valid, validation_error, habit = _validate(intent, db)
 
@@ -208,13 +258,7 @@ def run_loop1(
                 db.add(audit)
                 db.commit()
                 db.refresh(audit)
-                hint = metric or "no default"
-                prompt = (
-                    f"I don't know '{intent['proposed_habit']}' yet. "
-                    f"Create it (suggested default: {hint}) and log "
-                    f"{intent['amount']:g} {metric or ''}?"
-                )
-                return audit, None, prompt
+                return audit, None, proposal_prompt(intent, metric)
 
             metric, source = _resolve_metric(intent)
 
@@ -235,12 +279,7 @@ def run_loop1(
                 db.add(audit)
                 db.commit()
                 db.refresh(audit)
-                unit_hint = habit.metric or "a unit"
-                prompt = (
-                    f"Got it: {intent['amount']:g} of {habit.display_name} "
-                    f"on {intent['log_date']}. What unit? (e.g. {unit_hint})"
-                )
-                return audit, prompt, None
+                return audit, unit_prompt(intent, habit), None
 
             audit = AuditLog(
                 chat_id=chat_id,
@@ -340,13 +379,7 @@ def regenerate_from_feedback(
                 audit.error_message = None
                 db.commit()
                 db.refresh(audit)
-                hint = metric or "no default"
-                prompt = (
-                    f"I don't know '{intent['proposed_habit']}' yet. "
-                    f"Create it (suggested default: {hint}) and log "
-                    f"{intent['amount']:g} {metric or ''}?"
-                )
-                return audit, None, prompt
+                return audit, None, proposal_prompt(intent, metric)
 
             metric, source = _resolve_metric(intent)
 
@@ -364,12 +397,7 @@ def regenerate_from_feedback(
                 audit.error_message = None
                 db.commit()
                 db.refresh(audit)
-                unit_hint = habit.metric or "a unit"
-                prompt = (
-                    f"Got it: {intent['amount']:g} of {habit.display_name} "
-                    f"on {intent['log_date']}. What unit? (e.g. {unit_hint})"
-                )
-                return audit, prompt, None
+                return audit, unit_prompt(intent, habit), None
 
             audit.intent = {
                 **intent,

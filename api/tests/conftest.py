@@ -34,8 +34,10 @@ def _server_url():
         import pgserver
     except ImportError:
         pytest.exit("Set TEST_DATABASE_URL or `pip install pgserver`.", returncode=2)
-    data_dir = Path(tempfile.gettempdir()) / "habitflow-test-pg"
-    _pg_server = pgserver.get_server(data_dir, cleanup_mode="stop")
+    # Fresh cluster per session, deleted on exit: a killed run can't leave a
+    # half-recovered data dir behind for the next one.
+    data_dir = Path(tempfile.mkdtemp(prefix="habitflow-test-pg-"))
+    _pg_server = pgserver.get_server(data_dir, cleanup_mode="delete")
     return make_url(_pg_server.get_uri())
 
 
@@ -59,8 +61,16 @@ def pytest_configure(config):
     ).render_as_string(hide_password=False)
 
 
+@pytest.fixture(scope="session")
+def migrated():
+    from app.db import engine
+    from app.migrate import run_migrations
+
+    run_migrations(engine)
+
+
 @pytest.fixture(autouse=True)
-def clean_db():
+def clean_db(migrated):
     from app.db import engine
 
     seed = (INIT_DIR / "02_seed.sql").read_text()

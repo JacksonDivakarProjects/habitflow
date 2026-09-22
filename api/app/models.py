@@ -106,6 +106,7 @@ class DailyLog(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("NOW()")
     )
+    voided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # undo
 
     __table_args__ = (
         CheckConstraint("amount > 0", name="chk_logs_amount"),
