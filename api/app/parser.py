@@ -11,7 +11,7 @@ from typing import Optional
 
 from app.timeutil import today
 from app.units import ALIASES as UNIT_ALIASES
-from app.units import canonical
+from app.units import AMBIGUOUS, canonical
 
 
 @dataclass
@@ -75,6 +75,10 @@ def find_unit(lowered: str) -> Optional[str]:
     for m in re.finditer(rf"({_NUMBER})\s*([a-z]+)", text):
         if m.group(2) in UNIT_ALIASES:
             return canonical(m.group(2))
+        if m.group(2) in AMBIGUOUS:  # "500m": the habit decides (units.resolve)
+            return m.group(2)
+    if text.strip() in AMBIGUOUS:  # a bare "m" answer to "What unit?"
+        return text.strip()
     # Otherwise any unit word, ignoring 1-letter aliases ("h" in a stray word).
     for word in re.findall(r"\b[a-z]+\b", text):
         if len(word) > 1 and word in UNIT_ALIASES:

@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.models import DailyLog, Habit
 from app.timeutil import friendly_date, today
-from app.units import convert
+from app.units import convert, resolve
 
 RECENT_DAYS = 14  # reminders skip habits untouched for longer than this
 
@@ -41,7 +41,8 @@ def streak_days(db: Session, habit_id: int, ref: Optional[date] = None) -> int:
 
 
 def week_total(
-    db: Session, habit_id: int, metric: str, ref: Optional[date] = None
+    db: Session, habit_id: int, metric: str, ref: Optional[date] = None,
+    habit_unit: Optional[str] = None,
 ) -> float:
     """This ISO week's (Mon to ref) total for the habit, in `metric`.
     Logs in convertible units are converted; others are left out."""
@@ -56,7 +57,7 @@ def week_total(
     ).all()
     total = 0.0
     for amount, unit in rows:
-        converted = convert(float(amount), unit, metric)
+        converted = convert(float(amount), resolve(unit, habit_unit or metric), metric)
         if converted is not None:
             total += converted
     return round(total, 2)
@@ -74,7 +75,7 @@ def log_summary(db: Session, log: DailyLog, habit: Habit) -> dict:
         "log_date": log_date.isoformat(),
         "when": friendly_date(log_date),
         "streak_days": streak_days(db, habit.habit_id),
-        "week_total": week_total(db, habit.habit_id, log.metric),
+        "week_total": week_total(db, habit.habit_id, log.metric, habit_unit=habit.metric),
     }
 
 
@@ -88,6 +89,7 @@ def habit_stats(db: Session, since: date) -> list[dict]:
     ).all()
     groups: dict[tuple[int, str], dict] = {}
     for habit, amount, unit, log_date in rows:
+        unit = resolve(unit, habit.metric)  # old "m" rows: meters for runs, minutes else
         target = unit
         converted = float(amount)
         if habit.metric:

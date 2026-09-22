@@ -22,7 +22,7 @@ from app.models import AuditLog, Habit
 from app.parser import parse_correction, parse_text
 from app.sqlguard import bind_nulls, check_draft_sql
 from app.timeutil import friendly_date, today
-from app.units import canonical, quantity
+from app.units import canonical, quantity, resolve
 
 MAX_EXTRA_LOGS = 5
 
@@ -173,9 +173,9 @@ def _resolve_extras(intent: dict, db: Session) -> tuple[list[dict], list[str]]:
         if not _valid_date(log_date):
             skipped.append(f"{habit.display_name} (date isn't valid)")
             continue
-        metric, source = canonical(item.get("metric")), "explicit"
+        metric, source = resolve(item.get("metric"), habit.metric), "explicit"
         if not metric:
-            metric = canonical(item.get("suggested_metric")) or habit.metric
+            metric = resolve(item.get("suggested_metric"), habit.metric) or habit.metric
             source = "suggested"
         if not metric:
             skipped.append(f"{habit.display_name} (needs a unit, send it on its own)")
@@ -232,6 +232,8 @@ def _validate(intent: dict, db: Session) -> tuple[bool, Optional[str], Optional[
 
     if not habit.is_active:
         return False, f"Habit '{habit.name}' is inactive.", None
+    intent["metric"] = resolve(intent["metric"], habit.metric)
+    intent["suggested_metric"] = resolve(intent["suggested_metric"], habit.metric)
     intent["habit_name"] = habit.name
     intent["proposed_habit"] = None
     intent["extra_logs"], intent["skipped"] = _resolve_extras(intent, db)
