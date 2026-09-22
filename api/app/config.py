@@ -6,6 +6,8 @@ class Settings(BaseSettings):
 
     database_url: str
     llm_base_url: str = "http://llm:9000"
+    llm_timeout_seconds: float = 20
+    app_timezone: str = "Asia/Kolkata"
 
 
 settings = Settings()

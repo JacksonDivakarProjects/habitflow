@@ -1,7 +1,8 @@
 import json
-from datetime import date, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import yaml
 from openai import OpenAI
@@ -57,8 +58,9 @@ def _build_system_prompt(habits: list[dict]) -> str:
     )
 
     shape = json.dumps(SEMANTICS.get("intent_shape", {}), indent=2)
-    today = date.today().isoformat()
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    local_today = datetime.now(ZoneInfo(settings.app_timezone)).date()
+    today = local_today.isoformat()
+    yesterday = (local_today - timedelta(days=1)).isoformat()
 
     return f"""You are a Text-to-Intent + SQL engine for a personal habit tracker.
 
@@ -90,15 +92,15 @@ def extract_intent(
     previous_error: Optional[str] = None,
     clarification: Optional[str] = None,
     original_text: Optional[str] = None,
+    current_draft: Optional[dict] = None,
 ) -> dict:
     messages = [{"role": "system", "content": _build_system_prompt(habits)}]
 
     if clarification and original_text:
         messages.append({"role": "user", "content": original_text})
-        messages.append({
-            "role": "assistant",
-            "content": json.dumps({"question": "clarification needed"}),
-        })
+        # Show the model its own current draft so the follow-up corrects it.
+        draft = current_draft or {"question": "clarification needed"}
+        messages.append({"role": "assistant", "content": json.dumps(draft)})
         messages.append({"role": "user", "content": clarification})
     else:
         messages.append({"role": "user", "content": user_text})
@@ -108,9 +110,9 @@ def extract_intent(
         messages.append({
             "role": "user",
             "content": (
-                f"Your draft_sql failed the dry-run with this error:\n"
+                f"Your previous answer was rejected by validation:\n"
                 f"{previous_error}\n\n"
-                f"Analyze the error, correct the SQL, and return the corrected JSON."
+                f"Fix the problem and return the corrected JSON."
             ),
         })
 

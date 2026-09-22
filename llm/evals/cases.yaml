@@ -1,0 +1,92 @@
+# LLM eval set: real phrases and what the model must extract from them.
+# Run against the real model with:  cd llm && python -m evals.run
+#
+# expect fields (all optional):
+#   habit_name / proposed_habit   exact (proposed: after snake_case cleanup)
+#   amount                        number
+#   metric                        canonical unit, or null = "must not invent one"
+#   log_date                      today | yesterday | -N (N days ago)
+#   extra_logs                    [{habit_name, amount, metric?}] in order
+# A correction case also has original_text + current_draft.
+
+habits:
+  - {name: running, display_name: Running, default_metric: miles}
+  - {name: reading, display_name: Reading, default_metric: pages}
+  - {name: learning_sql, display_name: Learning SQL, default_metric: hours}
+  - {name: learning_concepts, display_name: Learning Concepts, default_metric: concepts}
+  - {name: reels, display_name: Reels, default_metric: hours}
+  - {name: meditation, display_name: Meditation, default_metric: minutes}
+
+cases:
+  # --- plain logs -------------------------------------------------------
+  - {name: basic, text: "ran 4 miles", expect: {habit_name: running, amount: 4, metric: miles, log_date: today}}
+  - {name: km, text: "ran 5k this morning", expect: {habit_name: running, amount: 5, metric: km, log_date: today}}
+  - {name: jog synonym, text: "went for a 3 mile jog", expect: {habit_name: running, amount: 3, metric: miles}}
+  - {name: decimal, text: "ran 2.5 miles", expect: {habit_name: running, amount: 2.5, metric: miles}}
+  - {name: reading pages, text: "read 20 pages", expect: {habit_name: reading, amount: 20, metric: pages}}
+  - {name: no unit, text: "read 20", expect: {habit_name: reading, amount: 20, metric: null}}
+  - {name: minutes abbrev, text: "meditated 15 mins", expect: {habit_name: meditation, amount: 15, metric: minutes}}
+  - {name: words, text: "meditated for twenty minutes", expect: {habit_name: meditation, amount: 20, metric: minutes}}
+  - {name: half hour, text: "meditated for half an hour", expect: {habit_name: meditation, amount: 30, metric: minutes}}
+  - {name: sql hours, text: "studied sql for 2 hours", expect: {habit_name: learning_sql, amount: 2, metric: hours}}
+  - {name: reels, text: "wasted 1.5 hours on instagram reels", expect: {habit_name: reels, amount: 1.5, metric: hours}}
+  - {name: concepts, text: "learned 3 new concepts", expect: {habit_name: learning_concepts, amount: 3, metric: concepts}}
+
+  # --- dates ------------------------------------------------------------
+  - {name: yesterday, text: "read 30 pages yesterday", expect: {habit_name: reading, amount: 30, log_date: yesterday}}
+  - {name: last night, text: "meditated 10 minutes last night", expect: {habit_name: meditation, amount: 10, log_date: yesterday}}
+  - {name: days ago, text: "ran 6 miles 2 days ago", expect: {habit_name: running, amount: 6, log_date: -2}}
+  - {name: day before yesterday, text: "day before yesterday I read 12 pages", expect: {habit_name: reading, amount: 12, log_date: -2}}
+
+  # --- new habits -------------------------------------------------------
+  - {name: new habit, text: "did 20 pushups", expect: {proposed_habit: pushups, amount: 20}}
+  - {name: new habit unit, text: "learned rust for 2 hours", expect: {proposed_habit: learning_rust, amount: 2, metric: hours}}
+  - {name: new habit water, text: "drank 8 glasses of water", expect: {proposed_habit: drinking_water, amount: 8, metric: glasses}}
+
+  # --- several habits ---------------------------------------------------
+  - name: two habits
+    text: "ran 3 miles and read 20 pages"
+    expect:
+      habit_name: running
+      amount: 3
+      extra_logs: [{habit_name: reading, amount: 20, metric: pages}]
+  - name: three habits
+    text: "today: meditated 10 min, read 15 pages, ran 2 miles"
+    expect:
+      extra_logs_count: 2
+  - name: two habits mixed dates
+    text: "ran 4 miles yesterday and read 10 pages today"
+    expect:
+      habit_name: running
+      log_date: yesterday
+      extra_logs: [{habit_name: reading, amount: 10}]
+
+  # --- corrections (the ✏️ Edit flow) -----------------------------------
+  - name: fix amount
+    original_text: "ran 4 miles"
+    current_draft: {habit_name: running, amount: 4, metric: miles, log_date: today}
+    text: "no, 6 miles"
+    expect: {habit_name: running, amount: 6, metric: miles, log_date: today}
+  - name: fix date keeps amount
+    original_text: "read 20 pages"
+    current_draft: {habit_name: reading, amount: 20, metric: pages, log_date: today}
+    text: "it was yesterday"
+    expect: {habit_name: reading, amount: 20, metric: pages, log_date: yesterday}
+  - name: fix habit
+    original_text: "did 30 minutes"
+    current_draft: {habit_name: reels, amount: 30, metric: minutes, log_date: today}
+    text: "wrong habit, that was meditation"
+    expect: {habit_name: meditation, amount: 30, metric: minutes}
+  - name: fix unit
+    original_text: "ran 5"
+    current_draft: {habit_name: running, amount: 5, metric: miles, log_date: today}
+    text: "km not miles"
+    expect: {habit_name: running, amount: 5, metric: km}
+  - name: add a habit
+    original_text: "ran 3 miles"
+    current_draft: {habit_name: running, amount: 3, metric: miles, log_date: today}
+    text: "also read 10 pages"
+    expect:
+      habit_name: running
+      amount: 3
+      extra_logs: [{habit_name: reading, amount: 10}]

@@ -1,9 +1,19 @@
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal
 
 from sqlalchemy import (
-    BigInteger, Boolean, CheckConstraint, Date, DateTime,
-    ForeignKey, Integer, Numeric, String, Text, text,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Date,
+    DateTime,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    Time,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -18,7 +28,7 @@ class Habit(Base):
     name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     display_name: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
-    metric: Mapped[str] = mapped_column(String(50), nullable=False)
+    metric: Mapped[str | None] = mapped_column(String(50))  # NULL if no natural unit
     target_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
     target_metric: Mapped[str | None] = mapped_column(String(50))
     is_active: Mapped[bool] = mapped_column(
@@ -73,6 +83,17 @@ class AuditLog(Base):
     )
 
 
+class ReminderSetting(Base):
+    __tablename__ = "reminder_settings"  # api/migrations/0002
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    remind_at: Mapped[time] = mapped_column(Time, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("TRUE"))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()")
+    )
+
+
 class DailyLog(Base):
     __tablename__ = "daily_logs"
 
@@ -97,6 +118,7 @@ class DailyLog(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("NOW()")
     )
+    voided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # undo
 
     __table_args__ = (
         CheckConstraint("amount > 0", name="chk_logs_amount"),
