@@ -1,0 +1,15 @@
+line-length = 100
+target-version = "py312"
+extend-exclude = [".venv"]
+
+[lint]
+select = ["E", "F", "W", "I", "B"]
+
+[lint.isort]
+known-first-party = ["app", "bot", "tests"]
+
+[lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query"]
+
+[lint.per-file-ignores]
+"**/tests/*" = ["E501"]
