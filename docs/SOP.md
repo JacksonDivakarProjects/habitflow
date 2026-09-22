@@ -300,23 +300,24 @@ docker login                                   # as jackdiva
 export HABITFLOW_TAG=1.0.0                     # a version; also push "latest" if you like
 docker compose build
 docker compose push api llm bot                # db is the official postgres image
-docker compose publish jackdiva/habitflow:compose-$HABITFLOW_TAG   # optional: the compose file itself
 ```
 
 **On a server (no source code needed):**
 
 ```bash
 mkdir habitflow && cd habitflow
-# either copy docker-compose.yml here, or run it straight from Docker Hub:
-#   docker compose -f oci://docker.io/jackdiva/habitflow:compose-1.0.0 ...
+# copy docker-compose.yml here (scp, or download it from the GitHub repo)
 nano .env && chmod 600 .env                     # same variables as .env.example
 echo HABITFLOW_TAG=1.0.0 >> .env                # pin the release you pushed
 docker compose pull
 docker compose up -d
 ```
 
-The database schema is created by the API on first start; nothing else is
-mounted. Upgrading is `HABITFLOW_TAG=<new>` in `.env`, then `docker compose
+Only those two files are needed: the `build:` lines are ignored when the
+images can be pulled, and the database schema is created by the API on
+first start. (`docker compose publish` works too and never includes your
+secrets, but a compose file run straight from `oci://` can't read a local
+`.env`, so copying the file is the supported route.) Upgrading is `HABITFLOW_TAG=<new>` in `.env`, then `docker compose
 pull && docker compose up -d`. Your data stays in the `habitflow_pgdata`
 volume. The images are built for the architecture of the machine that built
 them (usually `amd64`); for an ARM server build with

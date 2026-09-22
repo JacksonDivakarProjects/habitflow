@@ -1,13 +1,12 @@
 # HabitFlow: db + llm + api + bot.
 #
 # Local (from source):   docker compose up -d --build
-# Publish images:        docker compose build && docker compose push api llm bot
-# Publish this file:     docker compose publish jackdiva/habitflow:compose
-# Server (no source):    put .env next to this file, then
+# Publish images:        docker login && docker compose build && docker compose push api llm bot
+# Server (no source):    copy this file + .env into a folder, then
 #                        docker compose pull && docker compose up -d
 #
 # Secrets are read from .env at runtime (env_file) and are never ${...}
-# substituted into this file, so publishing it never leaks them.
+# substituted into this file, so sharing or publishing it never leaks them.
 
 name: habitflow  # fixed, so the volume is always habitflow_pgdata
 
