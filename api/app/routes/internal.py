@@ -13,10 +13,10 @@ from app import drafting
 from app.db import get_db
 from app.drafting import FeedbackFailed, regenerate_from_feedback, run_loop1
 from app.models import AuditLog, DailyLog, Habit, ReminderSetting
+from app.parser import find_habit, find_unit
 from app.progress import habit_stats, log_summary, reminder_check
 from app.timeutil import friendly_date, today
 from app.units import canonical, quantity
-from app.units import is_known as is_known_unit
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
@@ -143,6 +143,17 @@ class ClarifyRequest(BaseModel):
     value: str
 
 
+def _drop_for_new_log(audit: AuditLog, db: Session):
+    """The answer to a unit question was really a new log: cancel the question
+    and tell the bot (409 new_log) to draft the text as a fresh message."""
+    audit.status = "cancelled"
+    audit.error_message = "Unit question dropped: the answer was a new log"
+    db.commit()
+    raise HTTPException(
+        status_code=409, detail={"code": "new_log", "dropped": audit.user_input}
+    )
+
+
 @router.post("/clarify", response_model=DraftResponse)
 def clarify(req: ClarifyRequest, db: Session = Depends(get_db)):
     audit = _lock_audit(db, req.audit_id)
@@ -153,10 +164,20 @@ def clarify(req: ClarifyRequest, db: Session = Depends(get_db)):
     if intent.get("needs") != "unit":
         raise HTTPException(status_code=409, detail="Not a unit clarification")
 
-    words = req.value.strip().lower().split()
-    bare_word = words[0] if len(words) == 1 and words[0].isalpha() else None
-    if bare_word and is_known_unit(bare_word):
-        new_intent, metric = {}, bare_word  # "km", "Mins": no LLM needed
+    lowered = req.value.strip().lower()
+    words = lowered.split()
+    current = intent.get("habit_name")
+
+    # An answer about a different habit ("read 20 pages" to "What unit?" for a
+    # run) is a new log, not a unit: drop the question instead of mislabelling.
+    mentioned = find_habit(lowered)
+    if mentioned and mentioned != current:
+        _drop_for_new_log(audit, db)
+
+    quick_unit = find_unit(lowered) if len(words) <= 3 else None
+    bare_word = words[0].strip(".!") if len(words) == 1 else None
+    if quick_unit:
+        new_intent, metric = {}, quick_unit  # "km", "in km", "Mins.": no LLM needed
     else:
         try:
             new_intent = drafting.call_llm(
@@ -165,10 +186,15 @@ def clarify(req: ClarifyRequest, db: Session = Depends(get_db)):
                 current_draft=drafting.llm_view(intent),
                 habits=drafting.habits_context(db),
             )
-            metric = new_intent.get("metric") or new_intent.get("suggested_metric")
         except Exception:
             # LLM unavailable: a single word ("reps") is still usable as typed.
-            new_intent, metric = {}, bare_word
+            new_intent = {}
+            metric = bare_word if bare_word and bare_word.isalpha() else None
+        else:
+            other = new_intent.get("habit_name") or new_intent.get("proposed_habit")
+            if other and drafting._slug(other) != current:
+                _drop_for_new_log(audit, db)
+            metric = new_intent.get("metric") or new_intent.get("suggested_metric")
 
     if not metric:
         return DraftResponse(

@@ -11,7 +11,8 @@ from typing import Optional
 _ALIASES = {
     "miles": ["mile", "miles", "mi"],
     "km": ["km", "kms", "kilometer", "kilometers", "kilometre", "kilometres"],
-    "meters": ["m", "meter", "meters", "metre", "metres"],
+    # No bare "m": "30m" is minutes as often as meters. The LLM (or the user) decides.
+    "meters": ["meter", "meters", "metre", "metres"],
     "minutes": ["minute", "minutes", "min", "mins"],
     "hours": ["hour", "hours", "hr", "hrs", "h"],
     "seconds": ["second", "seconds", "sec", "secs"],

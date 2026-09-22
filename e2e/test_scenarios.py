@@ -355,3 +355,32 @@ def test_reminder_is_silent_when_all_done(chat, db):
     asyncio.run(chat.bot.send_reminder(job_context))
 
     send.assert_not_awaited()
+
+
+# ------------------------------------------------------------------
+# Final review findings, end to end
+# ------------------------------------------------------------------
+def test_new_log_while_a_unit_question_is_open(chat, db, fake_llm, make_intent):
+    fake_llm.queue(make_intent(metric=None, amount=5))
+    chat.say("ran 5")                                     # "What unit?"
+    fake_llm.queue(make_intent(habit_name="reading", amount=20, metric="pages"))
+
+    dropped, card = chat.say("read 20 pages")
+
+    assert dropped == "OK, I dropped “ran 5” (no unit) and read this as a new log."
+    assert card.startswith("📝 20 pages of Reading today")
+    chat.tap("✅ Approve")
+    [log] = _logs(db)
+    assert (log.habit_id, log.metric) == (2, "pages")  # not "5 pages of Running"
+
+
+def test_offline_edit_switches_habit(chat, db, fake_llm, make_intent):
+    fake_llm.queue(make_intent())
+    chat.say("ran 4 miles")
+    card = chat.last
+    chat.tap("✏️ Edit")
+    fake_llm.queue(RuntimeError("groq down"))
+
+    chat.say("reading, not running")
+
+    assert "4 pages of Reading today" in card.text

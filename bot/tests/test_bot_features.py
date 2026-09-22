@@ -158,7 +158,7 @@ def test_edit_api_unreachable(api):
 
     run(bot.handle_text(update, make_context(awaiting_feedback_for=7)))
 
-    assert replies(update) == [bot.UNREACHABLE]
+    assert replies(update)[0].startswith(bot.UNREACHABLE)
 
 
 def test_tapping_edit_on_another_card_switches_target(api):
@@ -369,3 +369,39 @@ def test_startup_survives_api_being_down(api):
 )
 def test_quantities_read_naturally(amount, unit, expected):
     assert bot._qty(amount, unit) == expected
+
+
+# ------------------------------------------------------------------
+# Final review findings
+# ------------------------------------------------------------------
+def test_edit_survives_a_network_error(api):
+    """Finding 4: a timeout used to drop Edit mode, so the resent fix became a new draft."""
+    api.on("POST", "/internal/feedback", raises=httpx.ReadTimeout("slow"))
+    update = make_update("6 miles, not 4")
+    context = make_context(awaiting_feedback_for=7, feedback_card_message_id=99)
+
+    run(bot.handle_text(update, context))
+
+    assert context.user_data == {"awaiting_feedback_for": 7, "feedback_card_message_id": 99}
+    assert replies(update)[0].startswith(bot.UNREACHABLE)
+    assert "Send your fix again" in replies(update)[0]
+
+
+def test_new_log_sent_to_a_unit_question_is_drafted(api):
+    """Finding 2: "read 20 pages" answering "What unit?" becomes its own log."""
+    api.on("POST", "/internal/clarify", status=409,
+           json={"detail": {"code": "new_log", "dropped": "ran 5"}})
+    api.on("POST", "/internal/draft", json={
+        "audit_id": 8, "preview": "20 pages of Reading today",
+        "metric_source": "explicit", "draft_sql": None,
+    })
+    update = make_update("read 20 pages")
+    context = make_context(awaiting_clarification={"audit_id": 7})
+
+    run(bot.handle_text(update, context))
+
+    assert context.user_data == {}
+    first, card = replies(update)
+    assert first == "OK, I dropped “ran 5” (no unit) and read this as a new log."
+    assert card.startswith("📝 20 pages of Reading today")
+    assert api.last_json()["text"] == "read 20 pages"

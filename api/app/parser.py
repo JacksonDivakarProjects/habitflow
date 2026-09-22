@@ -33,34 +33,50 @@ ALIASES = {
 }
 
 _NUMBER = r"\d+(?:\.\d+)?"
-_NEGATED = re.compile(rf"\b(?:not|instead of|rather than)\s+({_NUMBER})")
+# "not running", "not 4", "not 4 miles", "instead of 4 km": what the user is ruling out.
+_NEGATED = re.compile(
+    rf"\b(?:not|instead of|rather than)\s+(?:{_NUMBER}\s*[a-z]*|[a-z]+)"
+)
 _DATE_NUMBER = re.compile(r"\b\d+\s+(?:days?|weeks?)\s+ago\b")  # "2 days ago" isn't an amount
 
 
-def _find_habit(lowered: str) -> Optional[str]:
+def _blank(pattern: re.Pattern, text: str) -> str:
+    """Replace matches with spaces, keeping positions stable."""
+    return pattern.sub(lambda m: " " * len(m.group()), text)
+
+
+def _positive_part(lowered: str) -> str:
+    """The text without the parts the user negated."""
+    return _blank(_NEGATED, lowered)
+
+
+def find_habit(lowered: str) -> Optional[str]:
+    """The habit mentioned earliest in the (non-negated) text."""
+    text = _positive_part(lowered)
+    best = None
     for name, aliases in ALIASES.items():
-        if any(re.search(rf"\b{re.escape(a)}\b", lowered) for a in aliases):
-            return name
-    return None
+        for alias in aliases:
+            m = re.search(rf"\b{re.escape(alias)}\b", text)
+            if m and (best is None or m.start() < best[0]):
+                best = (m.start(), name)
+    return best[1] if best else None
 
 
 def _find_amount(lowered: str) -> Optional[Decimal]:
     """First number that isn't negated or part of a date: "6 miles, not 4" -> 6."""
-    lowered = _DATE_NUMBER.sub(lambda m: " " * len(m.group()), lowered)
-    negated = {m.start(1) for m in _NEGATED.finditer(lowered)}
-    for m in re.finditer(_NUMBER, lowered):
-        if m.start() not in negated:
-            return Decimal(m.group())
-    return None
+    text = _positive_part(_blank(_DATE_NUMBER, lowered))
+    m = re.search(_NUMBER, text)
+    return Decimal(m.group()) if m else None
 
 
-def _find_unit(lowered: str) -> Optional[str]:
+def find_unit(lowered: str) -> Optional[str]:
+    text = _positive_part(lowered)  # "not 4 miles, 6 km" -> km
     # Prefer the word right after a number ("5km", "5 km", "20 min").
-    for m in re.finditer(rf"({_NUMBER})\s*([a-z]+)", lowered):
+    for m in re.finditer(rf"({_NUMBER})\s*([a-z]+)", text):
         if m.group(2) in UNIT_ALIASES:
             return canonical(m.group(2))
-    # Otherwise any unit word, ignoring 1-letter aliases ("m" in "I'm").
-    for word in re.findall(r"\b[a-z]+\b", lowered):
+    # Otherwise any unit word, ignoring 1-letter aliases ("h" in a stray word).
+    for word in re.findall(r"\b[a-z]+\b", text):
         if len(word) > 1 and word in UNIT_ALIASES:
             return canonical(word)
     return None
@@ -86,7 +102,7 @@ def _find_date(lowered: str) -> Optional[str]:
 def parse_text(text: str) -> Optional[ParsedIntent]:
     lowered = text.lower()
 
-    habit_name = _find_habit(lowered)
+    habit_name = find_habit(lowered)
     if not habit_name:
         return None
     amount = _find_amount(lowered)
@@ -94,7 +110,7 @@ def parse_text(text: str) -> Optional[ParsedIntent]:
         return None
     if "tomorrow" in lowered:
         return None  # don't log the future
-    metric = _find_unit(lowered)
+    metric = find_unit(lowered)
 
     return ParsedIntent(
         habit_name=habit_name,
@@ -110,13 +126,13 @@ def parse_correction(text: str) -> dict:
     {"amount": 6.0, "metric": "km", "log_date": "..."}. Empty if nothing usable."""
     lowered = text.lower()
     fields: dict = {}
-    habit = _find_habit(lowered)
+    habit = find_habit(lowered)
     if habit:
         fields["habit_name"] = habit
     amount = _find_amount(lowered)
     if amount is not None:
         fields["amount"] = float(amount)
-    unit = _find_unit(lowered)
+    unit = find_unit(lowered)
     if unit:
         fields["metric"] = unit
     log_date = _find_date(lowered)

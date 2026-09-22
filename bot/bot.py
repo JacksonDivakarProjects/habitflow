@@ -71,6 +71,13 @@ def _escape_md(s: str) -> str:
     return s
 
 
+def _detail(r: httpx.Response):
+    try:
+        return r.json().get("detail")
+    except Exception:
+        return None
+
+
 def _friendly_error(r: httpx.Response) -> str:
     """Turn an API error into something a person can act on. Never raw JSON."""
     try:
@@ -418,7 +425,11 @@ async def _send_feedback(
             )
     except Exception:
         log.exception("feedback call failed")
-        await update.message.reply_text(UNREACHABLE)
+        # Keep the edit open: resending the fix should retry it, not start a new draft.
+        context.user_data["awaiting_feedback_for"] = audit_id
+        if card_message_id:
+            context.user_data["feedback_card_message_id"] = card_message_id
+        await update.message.reply_text(f"{UNREACHABLE} Send your fix again, or “cancel”.")
         return
 
     if r.status_code == 422:
@@ -474,6 +485,16 @@ async def _send_clarification(
         await update.message.reply_text(f"{UNREACHABLE} Reply again, or /cancel.")
         return
 
+    detail = _detail(r)
+    if r.status_code == 409 and isinstance(detail, dict) and detail.get("code") == "new_log":
+        # Not a unit but a new log ("read 20 pages"): drop the question, draft this.
+        context.user_data.pop("awaiting_clarification", None)
+        await update.message.reply_text(
+            f"OK, I dropped “{detail.get('dropped', 'the earlier one')}” (no unit) "
+            "and read this as a new log."
+        )
+        await _draft_new(update, context)
+        return
     if r.status_code in (404, 409):
         # The audit is gone or no longer waiting on us; stop routing here.
         context.user_data.pop("awaiting_clarification", None)
@@ -517,6 +538,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_clarification(update, context, awaiting["audit_id"])
         return
 
+    await _draft_new(update, context)
+
+
+async def _draft_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _typing(update, context)
     try:
         async with httpx.AsyncClient(timeout=settings.api_llm_timeout_seconds) as client:

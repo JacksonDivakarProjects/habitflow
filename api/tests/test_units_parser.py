@@ -31,7 +31,8 @@ def test_canonical(raw, expected):
         (5, "km", "mi", 5 / 1.609344),
         (90, "mins", "hours", 1.5),
         (2, "hours", "minutes", 120),
-        (1500, "m", "km", 1.5),
+        (1500, "meters", "km", 1.5),
+        (30, "m", "minutes", None),  # bare "m" is ambiguous: not converted
         (500, "ml", "liters", 0.5),
         (3, "pages", "pages", 3),
         (3, "pages", "km", None),

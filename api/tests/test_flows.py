@@ -86,7 +86,7 @@ def test_missing_unit_then_clarify(client, db, fake_llm, make_intent):
 
     fake_llm.queue(make_intent(metric="km"))
     r = client.post(
-        "/internal/clarify", json={"audit_id": body["audit_id"], "value": "it was km"}
+        "/internal/clarify", json={"audit_id": body["audit_id"], "value": "hmm I think it was km"}
     )
 
     assert r.status_code == 200
@@ -94,7 +94,7 @@ def test_missing_unit_then_clarify(client, db, fake_llm, make_intent):
     assert _audits(db)[-1].status == "pending"
     call = fake_llm.calls[-1]
     assert call["original_text"] == "ran 4"
-    assert call["clarification"] == "it was km"
+    assert call["clarification"] == "hmm I think it was km"
     running = next(h for h in call["habits"] if h["name"] == "running")
     assert running["default_metric"] == "miles"
 
@@ -194,7 +194,7 @@ def test_clarify_shows_llm_its_current_draft(client, fake_llm, make_intent):
     audit_id = _draft(client, "ran 4").json()["audit_id"]
 
     fake_llm.queue(make_intent(metric="km"))
-    client.post("/internal/clarify", json={"audit_id": audit_id, "value": "kilometres I think"})
+    client.post("/internal/clarify", json={"audit_id": audit_id, "value": "kilometres I think, not sure"})
 
     current = fake_llm.calls[-1]["current_draft"]
     assert (current["amount"], current["metric"]) == (4, None)
