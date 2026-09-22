@@ -85,10 +85,42 @@ def make_update(text=None, user_id=ALLOWED_USER, message_id=10, callback_data=No
     )
 
 
-def make_context(**user_data):
+class FakeJob:
+    def __init__(self, name, **kwargs):
+        self.name, self.kwargs, self.removed = name, kwargs, False
+
+    def schedule_removal(self):
+        self.removed = True
+
+
+class FakeJobQueue:
+    """The slice of telegram.ext.JobQueue the bot uses."""
+
+    def __init__(self):
+        self.jobs: list[FakeJob] = []
+
+    def run_daily(self, callback, time, chat_id, name):
+        job = FakeJob(name, callback=callback, time=time, chat_id=chat_id)
+        self.jobs.append(job)
+        return job
+
+    def get_jobs_by_name(self, name):
+        return [j for j in self.jobs if j.name == name and not j.removed]
+
+    def active(self):
+        return [j for j in self.jobs if not j.removed]
+
+
+def make_context(args=None, job_queue=None, **user_data):
     return SimpleNamespace(
         user_data=dict(user_data),
-        bot=SimpleNamespace(edit_message_text=AsyncMock(), send_chat_action=AsyncMock()),
+        args=list(args or []),
+        job_queue=job_queue if job_queue is not None else FakeJobQueue(),
+        bot=SimpleNamespace(
+            edit_message_text=AsyncMock(),
+            send_chat_action=AsyncMock(),
+            send_message=AsyncMock(),
+        ),
     )
 
 

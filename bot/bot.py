@@ -1,4 +1,6 @@
 import logging
+from datetime import time as dtime
+from zoneinfo import ZoneInfo
 
 import httpx
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,6 +24,7 @@ class Settings(BaseSettings):
     api_base_url: str = "http://api:8000"
     # Calls that hit the LLM: API worst case is 3 retries x LLM_TIMEOUT_SECONDS (20s).
     api_llm_timeout_seconds: float = 90
+    app_timezone: str = "Asia/Kolkata"  # reminder times are in this zone
 
 
 settings = Settings()
@@ -41,9 +44,17 @@ COMMANDS = [
     ("stats", "Last 30 days and streaks"),
     ("undo", "Undo your last log"),
     ("habits", "Your habits and their units"),
+    ("remind", "Daily check-in, e.g. /remind 21:00"),
     ("cancel", "Cancel the current question"),
     ("help", "How to use HabitFlow"),
 ]
+
+# Typed instead of an answer to a question, these mean /cancel.
+CANCEL_WORDS = {"cancel", "never mind", "nevermind", "nvm", "stop", "forget it", "skip"}
+
+
+def _is_cancel(text: str | None) -> bool:
+    return (text or "").strip().lower().rstrip("!.") in CANCEL_WORDS
 
 
 def authorized(update: Update) -> bool:
@@ -104,9 +115,9 @@ def _card_markup(audit_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def _undo_markup(log_id: int) -> InlineKeyboardMarkup:
+def _undo_markup(callback_data: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("↩️ Undo", callback_data=f"undo:{log_id}")]]
+        [[InlineKeyboardButton("↩️ Undo", callback_data=callback_data)]]
     )
 
 
@@ -116,9 +127,15 @@ def _format_card(
     metric_source: str,
     draft_sql: str | None,
     offline: bool = False,
+    skipped: list[str] | None = None,
 ) -> str:
+    lines = preview.splitlines() or [preview]
     suffix = " _(suggested unit)_" if metric_source == "suggested" else ""
-    body = f"📝 {_escape_md(preview)}{suffix}"
+    body = "\n".join(
+        f"📝 {_escape_md(line)}{suffix if i == 0 else ''}" for i, line in enumerate(lines)
+    )
+    if skipped:
+        body += "\n\n⚠️ Not included: " + _escape_md("; ".join(skipped))
     if offline:
         body += "\n\n⚡ _AI is offline, so this was read by the simple parser. Please check it._"
     body += f"\n\n_Draft #{audit_id}_"
@@ -127,17 +144,67 @@ def _format_card(
     return body
 
 
+def _card_text(data: dict) -> str:
+    return _format_card(
+        data["audit_id"],
+        data["preview"],
+        data.get("metric_source", "explicit"),
+        data.get("draft_sql"),
+        offline=data.get("offline", False),
+        skipped=data.get("skipped"),
+    )
+
+
+_SINGULAR = {  # units are stored plural; mirrors api/app/units.py
+    "miles": "mile", "meters": "meter", "minutes": "minute", "hours": "hour",
+    "seconds": "second", "pages": "page", "books": "book", "chapters": "chapter",
+    "steps": "step", "reps": "rep", "sets": "set", "concepts": "concept",
+    "glasses": "glass", "liters": "liter", "calories": "calorie", "laps": "lap",
+}
+
+
+def _qty(amount: float, unit: str) -> str:
+    """'1 mile', '2 miles'."""
+    return f"{amount:g} {_SINGULAR.get(unit, unit) if amount == 1 else unit}"
+
+
 def _format_logged(summary: dict) -> str:
     s = summary
-    lines = [f"✅ Logged {s['amount']:g} {s['metric']} of {s['habit']} {s['when']}"]
+    lines = [f"✅ Logged {_qty(s['amount'], s['metric'])} of {s['habit']} {s['when']}"]
     streak = s.get("streak_days") or 0
     parts = []
     if streak >= 2:
         parts.append(f"🔥 {streak}-day streak")
     elif streak == 1:
         parts.append("🌱 Day 1 of a new streak")
-    parts.append(f"{s['week_total']:g} {s['metric']} this week")
+    parts.append(f"{_qty(s['week_total'], s['metric'])} this week")
     lines.append(" · ".join(parts))
+    return "\n".join(lines)
+
+
+def _format_executed(data: dict) -> str:
+    summaries = data.get("summaries") or [data["summary"]]
+    return "\n\n".join(_format_logged(s) for s in summaries)
+
+
+def format_reminder(check: dict) -> str | None:
+    """Evening check-in text, or None when there's nothing worth saying."""
+    if not check["at_risk"] and not check["not_logged"]:
+        return None
+    lines = ["⏰ Evening check-in"]
+    for item in check["at_risk"]:
+        days = item["streak_days"]
+        if days > 1:
+            lines.append(f"🔥 {item['habit']}: log it today to keep your {days}-day streak going.")
+        else:
+            lines.append(
+                f"🌱 {item['habit']}: you started yesterday. Log it today to make it 2 days."
+            )
+    if check["not_logged"]:
+        lines.append("Not logged yet today: " + ", ".join(check["not_logged"]) + ".")
+    if check.get("done"):
+        lines.append("✅ Done today: " + ", ".join(check["done"]) + ".")
+    lines.append("Just reply here, like “ran 3 miles”.")
     return "\n".join(lines)
 
 
@@ -148,7 +215,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 HabitFlow is ready.\n\n"
         f"Just tell me what you did, like {EXAMPLES}. "
         "I'll show you a draft, and nothing is saved until you tap ✅.\n\n"
-        "Try /today, /stats or /help."
+        "Try /today, /stats or /help. Want an evening nudge? /remind 21:00"
     )
 
 
@@ -160,12 +227,14 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  “ran 4 miles”\n"
         "  “read 20 pages yesterday”\n"
         "  “meditated 10 min”\n"
-        "  “learned rust for 2 hours” (new habits are created for you)\n\n"
+        "  “learned rust for 2 hours” (new habits are created for you)\n"
+        "  “ran 3 miles and read 20 pages” (several at once)\n\n"
         "Each draft card has three buttons:\n"
         "  ✅ Approve saves it\n"
         "  ✏️ Edit lets you reply with a fix, like “6 miles, not 4”\n"
         "  🗑️ Discard throws it away\n"
-        "After saving you can tap ↩️ Undo, or send /undo later.\n\n"
+        "After saving you can tap ↩️ Undo, or send /undo later.\n"
+        "Answering a question? Reply “cancel” to drop it.\n\n"
         "Commands:\n"
         + "\n".join(f"  /{name} — {desc}" for name, desc in COMMANDS)
     )
@@ -220,7 +289,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for row in rows:
         days = row["days"]
         line = (
-            f"• {row['habit']}: {row['total']:g} {row['metric']} "
+            f"• {row['habit']}: {_qty(row['total'], row['metric'])} "
             f"on {days} day{'s' if days != 1 else ''}"
         )
         if row.get("streak_days", 0) >= 2:
@@ -253,7 +322,7 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = (item["habit"], item["metric"])
         totals[key] = totals.get(key, 0) + item["amount"]
     lines = ["📅 Today so far:"] + [
-        f"• {habit}: {amount:g} {metric}" for (habit, metric), amount in totals.items()
+        f"• {habit}: {_qty(amount, metric)}" for (habit, metric), amount in totals.items()
     ]
     await update.message.reply_text("\n".join(lines))
 
@@ -291,13 +360,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _send_card(update: Update, data: dict):
-    body = _format_card(
-        data["audit_id"],
-        data["preview"],
-        data.get("metric_source", "explicit"),
-        data.get("draft_sql"),
-        offline=data.get("offline", False),
-    )
+    body = _card_text(data)
     markup = _card_markup(data["audit_id"])
     try:
         await update.message.reply_text(body, reply_markup=markup, parse_mode="Markdown")
@@ -327,6 +390,19 @@ async def _handle_draft_result(update: Update, context: ContextTypes.DEFAULT_TYP
         await _send_habit_card(update, data["audit_id"], data["prompt"])
         return
     await _send_card(update, data)
+
+
+async def _retire_card(update: Update, context: ContextTypes.DEFAULT_TYPE, message_id):
+    if not message_id:
+        return
+    try:
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=message_id,
+            text="✏️ Changed. See my next message.",
+        )
+    except Exception:
+        log.warning("could not retire card %s", message_id)
 
 
 async def _send_feedback(
@@ -361,17 +437,13 @@ async def _send_feedback(
 
     data = r.json()
     if data.get("needs_input"):
+        # The old card's buttons no longer apply: the draft now needs an answer.
+        await _retire_card(update, context, card_message_id)
         await _handle_draft_result(update, context, data)
         return
 
     # Regenerated: update the original card in place.
-    body = _format_card(
-        data["audit_id"],
-        data["preview"],
-        data.get("metric_source", "explicit"),
-        data.get("draft_sql"),
-        offline=data.get("offline", False),
-    )
+    body = _card_text(data)
     if card_message_id:
         try:
             await context.bot.edit_message_text(
@@ -425,11 +497,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pending_feedback = context.user_data.pop("awaiting_feedback_for", None)
     if pending_feedback is not None:
+        if _is_cancel(update.message.text):
+            context.user_data.pop("feedback_card_message_id", None)
+            await update.message.reply_text("OK, I left the draft as it was.")
+            return
         await _send_feedback(update, context, pending_feedback, update.message.text)
         return
 
     awaiting = context.user_data.get("awaiting_clarification")
     if awaiting is not None:
+        if _is_cancel(update.message.text):
+            context.user_data.pop("awaiting_clarification", None)
+            try:
+                await _post("/internal/discard", {"audit_id": awaiting["audit_id"]})
+            except Exception:
+                log.exception("discard after cancel failed")
+            await update.message.reply_text("OK, dropped it.")
+            return
         await _send_clarification(update, context, awaiting["audit_id"])
         return
 
@@ -489,7 +573,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"{query.message.text}\n\n"
             "✏️ What should change? Reply with the fix, like “6 miles, not 4” "
-            "or “it was yesterday”. /cancel keeps it as is.",
+            "or “it was yesterday”. Reply “cancel” to keep it as is.",
             reply_markup=_card_markup(target_id),
         )
         return
@@ -498,6 +582,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "approve": ("/internal/execute", {"audit_id": target_id}),
         "discard": ("/internal/discard", {"audit_id": target_id}),
         "undo": ("/internal/undo", {"log_id": target_id}),
+        "undo_audit": ("/internal/undo", {"audit_id": target_id}),
         "create_habit": ("/internal/approve_habit", {"audit_id": target_id, "accept": True}),
         "cancel_habit": ("/internal/approve_habit", {"audit_id": target_id, "accept": False}),
     }
@@ -525,12 +610,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.get("status") == "already_executed":
             await query.edit_message_text("✅ Already logged.")
             return
-        await query.edit_message_text(
-            _format_logged(data["summary"]), reply_markup=_undo_markup(data["log_id"])
-        )
+        several = len(data.get("log_ids") or []) > 1
+        undo = f"undo_audit:{target_id}" if several else f"undo:{data['log_id']}"
+        await query.edit_message_text(_format_executed(data), reply_markup=_undo_markup(undo))
     elif action == "discard":
         await query.edit_message_text("🗑️ Discarded.")
-    elif action == "undo":
+    elif action in ("undo", "undo_audit"):
         if data.get("status") == "already_undone":
             await query.edit_message_text(f"↩️ Already undone: {data['preview']}.")
         else:
@@ -540,12 +625,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["awaiting_clarification"] = {"audit_id": target_id}
             await query.edit_message_text(data["prompt"])
             return
-        body = _format_card(
-            target_id,
-            data["preview"],
-            data.get("metric_source", "explicit"),
-            data.get("draft_sql"),
-        )
+        body = _card_text(data)
         try:
             await query.edit_message_text(
                 f"✨ New habit created.\n\n{body}",
@@ -561,6 +641,101 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("OK, I didn't create it.")
 
 
+# ------------------------------------------------------------------
+# Reminders
+# ------------------------------------------------------------------
+def _job_name(chat_id: int) -> str:
+    return f"reminder:{chat_id}"
+
+
+def unschedule_reminder(job_queue, chat_id: int):
+    for job in job_queue.get_jobs_by_name(_job_name(chat_id)):
+        job.schedule_removal()
+
+
+def schedule_reminder(job_queue, chat_id: int, remind_at: str):
+    """(Re)schedule the daily check-in at "HH:MM" in the app timezone."""
+    unschedule_reminder(job_queue, chat_id)
+    hour, minute = (int(x) for x in remind_at.split(":"))
+    job_queue.run_daily(
+        send_reminder,
+        time=dtime(hour, minute, tzinfo=ZoneInfo(settings.app_timezone)),
+        chat_id=chat_id,
+        name=_job_name(chat_id),
+    )
+
+
+async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{settings.api_base_url}/internal/reminders/check", params={"chat_id": chat_id}
+            )
+        r.raise_for_status()
+    except Exception:
+        log.exception("reminder check failed")
+        return  # a missed nudge is better than an error message at 9pm
+    text = format_reminder(r.json())
+    if text:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+
+
+async def _put_reminder(payload: dict) -> httpx.Response:
+    async with httpx.AsyncClient(timeout=10) as client:
+        return await client.put(f"{settings.api_base_url}/internal/reminders", json=payload)
+
+
+async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    chat_id = update.effective_chat.id
+    arg = " ".join(context.args or []).strip().lower()
+    job_queue = context.job_queue
+    try:
+        if not arg:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(f"{settings.api_base_url}/internal/reminders")
+            mine = next((x for x in r.json() if x["chat_id"] == chat_id), None)
+            if mine and mine["enabled"]:
+                await update.message.reply_text(
+                    f"⏰ Reminders are on at {mine['remind_at']}. "
+                    "/remind 20:30 changes the time, /remind off stops them."
+                )
+            else:
+                await update.message.reply_text(
+                    "Reminders are off. Try /remind 21:00 or /remind 9pm "
+                    "for a daily evening check-in."
+                )
+            return
+        if arg in ("off", "stop", "no", "disable"):
+            await _put_reminder({"chat_id": chat_id, "remind_at": None, "enabled": False})
+            if job_queue:
+                unschedule_reminder(job_queue, chat_id)
+            await update.message.reply_text("🔕 Reminders are off.")
+            return
+        r = await _put_reminder({"chat_id": chat_id, "remind_at": arg, "enabled": True})
+    except Exception:
+        log.exception("reminder settings call failed")
+        await update.message.reply_text(UNREACHABLE)
+        return
+    if r.status_code == 422:
+        await update.message.reply_text(
+            "I didn't understand that time. Try /remind 21:00 or /remind 9pm."
+        )
+        return
+    if r.status_code != 200:
+        await update.message.reply_text(_friendly_error(r))
+        return
+    remind_at = r.json()["remind_at"]
+    if job_queue:
+        schedule_reminder(job_queue, chat_id, remind_at)
+    await update.message.reply_text(
+        f"⏰ Done. I'll check in every day at {remind_at} ({settings.app_timezone}), "
+        "but only if something still needs logging."
+    )
+
+
 async def on_startup(app: Application):
     try:
         await app.bot.set_my_commands([BotCommand(n, d) for n, d in COMMANDS])
@@ -570,8 +745,17 @@ async def on_startup(app: Application):
         async with httpx.AsyncClient(timeout=5) as client:
             r = await client.get(f"{settings.api_base_url}/health")
             log.info("API health: %s", r.json())
+            reminders = (await client.get(f"{settings.api_base_url}/internal/reminders")).json()
     except Exception as e:
         log.warning("API not reachable on startup: %s", e)
+        return
+    if app.job_queue is None:
+        log.warning("job queue unavailable; install python-telegram-bot[job-queue]")
+        return
+    for item in reminders:
+        if item["enabled"]:
+            schedule_reminder(app.job_queue, item["chat_id"], item["remind_at"])
+            log.info("reminder scheduled for %s at %s", item["chat_id"], item["remind_at"])
 
 
 def main():
@@ -587,6 +771,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("today", today_cmd))
     app.add_handler(CommandHandler("undo", undo_cmd))
+    app.add_handler(CommandHandler("remind", remind_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

@@ -1,5 +1,7 @@
 """Bug 7: the keyword blocklist let destructive SQL through to EXPLAIN."""
 
+from pathlib import Path
+
 import pytest
 from sqlalchemy import select, text
 
@@ -86,3 +88,17 @@ def test_habits_table_intact_after_attack_attempts(client, db, fake_llm, make_in
     client.post("/internal/draft", json={"chat_id": 7, "text": "ran 4 miles"})
 
     assert db.execute(text("SELECT count(*) FROM habits")).scalar() == 6
+
+
+def _semantics_sql_examples():
+    import yaml
+
+    path = Path(__file__).resolve().parents[2] / "llm" / "semantics.yaml"
+    return [ex["draft_sql"] for ex in yaml.safe_load(path.read_text())["sql_examples"]]
+
+
+@pytest.mark.parametrize("sql", _semantics_sql_examples())
+def test_prompt_examples_pass_the_guard(db, sql):
+    """The SQL we show the LLM as an example must be SQL we accept."""
+    assert check_draft_sql(sql) is None
+    assert drafting._dry_run_sql(db, sql) is None

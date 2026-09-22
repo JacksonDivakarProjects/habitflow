@@ -616,7 +616,8 @@ def test_help_lists_every_command():
 
 def test_startup_registers_command_menu(api):
     api.on("GET", "/health", json={"status": "ok"})
-    app = SimpleNamespace(bot=SimpleNamespace(set_my_commands=AsyncMock()))
+    api.on("GET", "/internal/reminders", json=[])
+    app = SimpleNamespace(bot=SimpleNamespace(set_my_commands=AsyncMock()), job_queue=None)
 
     run(bot.on_startup(app))
 

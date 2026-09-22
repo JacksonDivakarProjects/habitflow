@@ -5,3 +5,4 @@ __pycache__/
 .env
 requirements-dev.txt
 pytest.ini
+evals/

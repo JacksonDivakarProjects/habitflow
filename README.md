@@ -35,9 +35,23 @@ Telegram ──> bot ──HTTP──> api ──HTTP──> llm ──> Groq (L
    The confirmation shows your streak and weekly total, plus a **↩️ Undo**
    button.
 
-If the LLM is unreachable, simple messages about known habits ("ran 3 miles
-yesterday") still work. They are read by a regex parser (`api/app/parser.py`),
-and the card is marked *AI is offline* so you know to check it.
+**Several habits at once.** "ran 3 miles and read 20 pages" becomes one card
+with one line per log. Approve saves them all, and one Undo reverts them all.
+A part that can't be logged directly, such as a brand-new habit, is listed
+under *Not included* with the reason, so you can send it on its own.
+
+**Edits never lose your draft.** If a correction can't be applied, the
+original card stays approvable and you can simply try again. Every
+correction is recorded in the draft's `feedback_history`.
+
+**Units.** Names are normalized ("Mins" becomes minutes, "mi" becomes
+miles). Totals convert within a family (km and miles, minutes and hours,
+ml and liters), so "5 km" and "1 mile" add up in `/stats`.
+
+**AI offline.** If the LLM is unreachable, simple messages about known
+habits ("ran 3 miles yesterday") and simple corrections ("6 km, not 4",
+"it was yesterday") still work through a regex parser (`api/app/parser.py`).
+The card is marked *AI is offline* so you know to check it.
 
 Every step is recorded in `audit_log`. Its `status` column moves through
 `pending` / `awaiting_input` → `executed` | `failed` | `cancelled` |
@@ -90,8 +104,10 @@ migrations to be idempotent (`IF NOT EXISTS`).
 | `/today` | What you've logged today |
 | `/stats` | Totals and streaks for the last 30 days |
 | `/undo` | Void your most recent log (it stays in the audit trail) |
+| `ran 3 miles and read 20 pages` | One card with two lines; Approve logs both |
 | `/habits` | Tracked habits and their default units |
-| `/cancel` | Drop an open unit question or edit |
+| `/remind 21:00` (or `9pm`) | A daily evening check-in, sent only if a streak is at risk or something is unlogged. `/remind off` stops it; `/remind` shows the setting |
+| `/cancel`, or reply “cancel” | Drop an open unit question or edit |
 
 Errors are shown in plain language, for example "This draft was replaced by
 a newer one." Errors from a button press appear as a popup, so the card
@@ -106,8 +122,30 @@ no network calls or API keys are needed.
 cd api && pip install -r requirements-dev.txt && pytest   # needs Postgres, see below
 cd llm && pip install -r requirements-dev.txt && pytest
 cd bot && pip install -r requirements-dev.txt && pytest
+cd e2e && pytest                                           # needs api + bot requirements
 ruff check .                                               # from repo root
 ```
+
+| Suite | What it covers |
+|---|---|
+| `api/tests` | Every draft, clarify, approve, edit, undo, discard and reminder path; the SQL guard; units and the regex parser; migrations. `test_feedback.py` covers the ✏️ Edit flow on its own. |
+| `llm/tests` | Prompt construction, the `/extract` endpoint, and the eval scorer. |
+| `bot/tests` | Every handler and button with a faked API: wording, error popups, "cancel" words, reminders and scheduling. |
+| `e2e` | Whole conversations. The real bot handlers call the real API (in process) over a real database, with only Telegram and the LLM scripted. A small `Chat` simulator records every message, button and edit. |
+
+### LLM evals
+
+`llm/evals/cases.yaml` holds 27 real phrases covering plain logs,
+relative dates, new habits, several habits in one message, and
+corrections, each with the expected intent. To score the real model
+(this makes one Groq request per case):
+
+```bash
+cd llm && GROQ_API_KEY=... python -m evals.run --min-pass 0.9
+```
+
+Run it after changing `semantics.yaml` or `GROQ_MODEL_NAME`. It is not run
+in CI because it needs a key and costs tokens.
 
 The API tests need a real Postgres, because the schema relies on JSONB,
 partial unique indexes and `EXPLAIN`. They create a throwaway

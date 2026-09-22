@@ -80,6 +80,7 @@ intent_shape:
   log_date: "YYYY-MM-DD"
   confidence: "0.0 to 1.0"
   draft_sql: "a valid Postgres INSERT into daily_logs using :named placeholders for amount/metric/log_date"
+  extra_logs: "list of the OTHER logs in the same message, each {habit_name, amount, metric, suggested_metric, log_date}; [] when the message has one log"
 
 # ------------------------------------------------------------
 # Rules
@@ -88,11 +89,14 @@ rules:
   - "amount must be a positive number"
   - "log_date must be YYYY-MM-DD, never in the future"
   - "metric: the unit the user EXPLICITLY mentioned, lowercase, or null"
+  - "units: use full plural names: miles, km, minutes, hours, pages, reps (not mi, mins, hrs)"
   - "suggested_metric: when metric is null, your best guess based on habit default or recently used unit"
   - "if no known habit matches, propose a short lowercase snake_case name in proposed_habit"
   - "habit_name must match a name from KNOWN HABITS or be null"
   - "draft_sql: INSERT INTO daily_logs with a subquery to look up habit_id by name"
   - "draft_sql: use :amount, :metric, :log_date as named placeholders"
+  - "several habits in one message (\"ran 3 miles and read 20 pages\"): the first goes in the main fields, the rest in extra_logs, and draft_sql inserts one row per log with :amount_2, :metric_2, :log_date_2 and so on"
+  - "a follow-up message corrects your previous JSON: keep every field the user did not change"
   - "never use DROP, DELETE, UPDATE, or TRUNCATE"
   - "return ONLY the JSON object, no markdown"
 
@@ -115,3 +119,10 @@ sql_examples:
         (SELECT habit_id FROM habits WHERE name = 'reading'),
         :amount, :metric, :log_date, 'llm'
       )
+
+  - intent: "log 3 miles of running and 20 pages of reading"
+    draft_sql: |
+      INSERT INTO daily_logs (habit_id, amount, metric, log_date, source)
+      VALUES
+        ((SELECT habit_id FROM habits WHERE name = 'running'), :amount, :metric, :log_date, 'llm'),
+        ((SELECT habit_id FROM habits WHERE name = 'reading'), :amount_2, :metric_2, :log_date_2, 'llm')

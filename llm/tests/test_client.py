@@ -145,3 +145,15 @@ def test_extract_endpoint_non_json_reply_is_502(api, groq):
     r = api.post("/extract", json={"user_text": "x", "habits": []})
 
     assert r.status_code == 502
+
+
+def test_system_prompt_explains_multi_habit_messages():
+    prompt = client._build_system_prompt(HABITS)
+
+    assert '"extra_logs"' in prompt
+    assert "several habits in one message" in prompt
+    assert ":amount_2" in prompt  # the multi-row SQL example
+
+
+def test_system_prompt_asks_for_canonical_units():
+    assert "full plural names" in client._build_system_prompt(HABITS)

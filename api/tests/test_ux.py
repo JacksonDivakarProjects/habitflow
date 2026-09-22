@@ -92,11 +92,12 @@ def test_week_total_is_per_unit_this_week_and_live_only(db):
     _log(db, 0, amount=3)
     _log(db, days_since_monday, amount=2)       # Monday counts
     _log(db, days_since_monday + 1, amount=50)  # last Sunday does not
-    _log(db, 0, amount=5, metric="km")          # other unit
+    _log(db, 0, amount=8.05, metric="km")       # converts: ~5 miles
+    _log(db, 0, amount=30, metric="minutes")    # can't convert to miles: left out
     _log(db, 0, amount=7, voided=True)
 
-    assert progress.week_total(db, RUNNING, "miles") == 5
-    assert progress.week_total(db, RUNNING, "km") == 5
+    assert progress.week_total(db, RUNNING, "miles") == 10.0
+    assert progress.week_total(db, RUNNING, "km") == 16.1  # 5 mi = 8.05 km, + 8.05 km
 
 
 def test_execute_returns_progress_summary(client, db, fake_llm, make_intent):
@@ -127,7 +128,8 @@ def test_undo_by_log_id(client, db, fake_llm, make_intent):
     r = client.post("/internal/undo", json={"log_id": log_id})
 
     assert r.json() == {
-        "status": "undone", "log_id": log_id, "preview": "4 miles of Running today",
+        "status": "undone", "log_id": log_id, "log_ids": [log_id],
+        "preview": "4 miles of Running today",
     }
     db.expire_all()
     assert db.get(DailyLog, log_id).voided_at is not None

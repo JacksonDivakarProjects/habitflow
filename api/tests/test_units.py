@@ -66,11 +66,18 @@ def test_validate_rejects_non_positive_amount(db, make_intent, amount):
     assert "amount" in error.lower()
 
 
-def test_validate_rejects_bad_proposed_habit_name(db, make_intent):
-    intent = make_intent(habit_name=None, proposed_habit="learn rust!")
+def test_validate_cleans_up_proposed_habit_name(db, make_intent):
+    intent = make_intent(habit_name=None, proposed_habit="Learn Rust!")
+    ok, _, habit = drafting._validate(intent, db)
+    assert ok and habit is None
+    assert intent["proposed_habit"] == "learn_rust"
+
+
+def test_validate_rejects_proposed_name_without_letters(db, make_intent):
+    intent = make_intent(habit_name=None, proposed_habit="!!!")
     ok, error, _ = drafting._validate(intent, db)
     assert not ok
-    assert "alphanumeric" in error
+    assert "letters or digits" in error
 
 
 def test_validate_maps_proposal_to_existing_habit(db, make_intent):

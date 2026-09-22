@@ -6,7 +6,7 @@ extend-exclude = [".venv"]
 select = ["E", "F", "W", "I", "B"]
 
 [lint.isort]
-known-first-party = ["app", "bot", "tests"]
+known-first-party = ["app", "bot", "tests", "evals", "conftest"]
 
 [lint.flake8-bugbear]
 extend-immutable-calls = ["fastapi.Depends", "fastapi.Query"]

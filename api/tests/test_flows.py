@@ -56,7 +56,10 @@ def test_execute_is_idempotent(client, db, fake_llm, make_intent):
     client.post("/internal/execute", json={"audit_id": audit_id})
     r = client.post("/internal/execute", json={"audit_id": audit_id})
 
-    assert r.json() == {"status": "already_executed", "log_id": 1, "summary": None}
+    assert r.json() == {
+        "status": "already_executed", "log_id": 1, "log_ids": [1],
+        "summary": None, "summaries": [],
+    }
     assert len(db.execute(select(DailyLog)).scalars().all()) == 1
 
 
@@ -82,14 +85,16 @@ def test_missing_unit_then_clarify(client, db, fake_llm, make_intent):
     assert _audits(db)[-1].status == "awaiting_input"
 
     fake_llm.queue(make_intent(metric="km"))
-    r = client.post("/internal/clarify", json={"audit_id": body["audit_id"], "value": "km"})
+    r = client.post(
+        "/internal/clarify", json={"audit_id": body["audit_id"], "value": "it was km"}
+    )
 
     assert r.status_code == 200
     assert r.json()["preview"].startswith("4 km of Running")
     assert _audits(db)[-1].status == "pending"
     call = fake_llm.calls[-1]
     assert call["original_text"] == "ran 4"
-    assert call["clarification"] == "km"
+    assert call["clarification"] == "it was km"
     running = next(h for h in call["habits"] if h["name"] == "running")
     assert running["default_metric"] == "miles"
 
@@ -189,7 +194,7 @@ def test_clarify_shows_llm_its_current_draft(client, fake_llm, make_intent):
     audit_id = _draft(client, "ran 4").json()["audit_id"]
 
     fake_llm.queue(make_intent(metric="km"))
-    client.post("/internal/clarify", json={"audit_id": audit_id, "value": "km"})
+    client.post("/internal/clarify", json={"audit_id": audit_id, "value": "kilometres I think"})
 
     current = fake_llm.calls[-1]["current_draft"]
     assert (current["amount"], current["metric"]) == (4, None)
@@ -229,13 +234,23 @@ def test_llm_down_and_unparseable_returns_422(client, db, fake_llm):
 
 
 def test_invalid_intent_retries_with_error_then_succeeds(client, db, fake_llm, make_intent):
-    fake_llm.queue(make_intent(habit_name="swimming"), make_intent())
+    fake_llm.queue(make_intent(amount=0), make_intent())
 
     r = _draft(client)
 
     assert r.status_code == 200
-    assert "not known" in fake_llm.calls[1]["previous_error"]
+    assert "positive" in fake_llm.calls[1]["previous_error"]
     assert [a.status for a in _audits(db)] == ["failed", "pending"]
+
+
+def test_unknown_habit_name_is_offered_as_new_habit(client, fake_llm, make_intent):
+    fake_llm.queue(make_intent(habit_name="Swimming", metric="laps"))
+
+    body = _draft(client, "swam 4 laps").json()
+
+    assert body["needs_input"] == "habit"
+    assert body["prompt"].startswith("“Swimming” is a new habit.")
+    assert len(fake_llm.calls) == 1  # no retry round trip
 
 
 def test_new_draft_supersedes_previous_pending(client, db, fake_llm, make_intent):
