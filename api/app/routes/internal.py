@@ -1,11 +1,13 @@
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.db import get_db
+from app.drafting import regenerate_from_feedback, run_loop1
 from app.models import AuditLog, DailyLog, Habit
-from app.parser import UNIT_MAP, parse_text
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
@@ -43,90 +45,53 @@ class DraftResponse(BaseModel):
     audit_id: int
     preview: str | None = None
     intent: dict | None = None
+    draft_sql: str | None = None
     needs_input: str | None = None
     prompt: str | None = None
+    metric_source: str | None = None
 
 
 @router.post("/draft", response_model=DraftResponse)
 def draft(req: DraftRequest, db: Session = Depends(get_db)):
-    parsed = parse_text(req.text)
-    if parsed is None:
-        audit = AuditLog(
-            chat_id=req.chat_id,
-            user_input=req.text,
-            status="failed",
-            error_message="Could not parse a habit and amount from the input",
-            iteration_count=1,
-        )
-        db.add(audit)
-        db.commit()
-        raise HTTPException(
-            status_code=422,
-            detail="Couldn't understand. Try: 'ran 4 miles today'",
-        )
+    audit, clarify_prompt, proposal_prompt = run_loop1(req.text, req.chat_id, db)
 
-    habit = db.execute(
-        select(Habit).where(Habit.name == parsed.habit_name)
-    ).scalar_one_or_none()
-    if habit is None or not habit.is_active:
-        raise HTTPException(
-            status_code=422, detail=f"Unknown habit: {parsed.habit_name}"
-        )
-
-    intent = {
-        "habit_name": parsed.habit_name,
-        "habit_id": habit.habit_id,
-        "amount": float(parsed.amount),
-        "metric": parsed.metric,
-        "log_date": parsed.log_date,
-        "confidence": parsed.confidence,
-        "raw_text": req.text,
-    }
-
-    # No unit given → ask
-    if parsed.metric is None:
-        audit = AuditLog(
-            chat_id=req.chat_id,
-            user_input=req.text,
-            intent={**intent, "needs": "unit"},
-            status="awaiting_input",
-            iteration_count=1,
-        )
-        db.add(audit)
-        db.commit()
-        db.refresh(audit)
-
+    if clarify_prompt:
         return DraftResponse(
             audit_id=audit.audit_id,
             needs_input="unit",
-            prompt=(
-                f"Got it: {parsed.amount:g} of {habit.display_name} "
-                f"on {parsed.log_date}. What unit? "
-                f"(e.g. {habit.metric})"
-            ),
+            prompt=clarify_prompt,
+            draft_sql=audit.draft_sql,
+        )
+    if proposal_prompt:
+        return DraftResponse(
+            audit_id=audit.audit_id,
+            needs_input="habit",
+            prompt=proposal_prompt,
+            draft_sql=audit.draft_sql,
+        )
+    if audit.status == "failed":
+        raise HTTPException(
+            status_code=422,
+            detail=audit.error_message or "Couldn't understand that.",
         )
 
-    # Full intent → pending card
+    habit = db.get(Habit, audit.intent["habit_id"])
+    source = audit.intent.get("metric_source", "explicit")
     preview = (
-        f"{parsed.amount:g} {parsed.metric} of {habit.display_name} "
-        f"on {parsed.log_date}"
+        f"{audit.intent['amount']:g} {audit.intent['metric']} of "
+        f"{habit.display_name} on {audit.intent['log_date']}"
     )
-    audit = AuditLog(
-        chat_id=req.chat_id,
-        user_input=req.text,
-        intent=intent,
-        status="pending",
-        iteration_count=1,
+    return DraftResponse(
+        audit_id=audit.audit_id,
+        preview=preview,
+        intent=audit.intent,
+        draft_sql=audit.draft_sql,
+        metric_source=source,
     )
-    db.add(audit)
-    db.commit()
-    db.refresh(audit)
-
-    return DraftResponse(audit_id=audit.audit_id, preview=preview, intent=intent)
 
 
 # ------------------------------------------------------------------
-# /clarify
+# /clarify — missing unit
 # ------------------------------------------------------------------
 class ClarifyRequest(BaseModel):
     audit_id: int
@@ -146,46 +111,158 @@ def clarify(req: ClarifyRequest, db: Session = Depends(get_db)):
     if audit is None:
         raise HTTPException(status_code=404, detail="Audit not found")
     if audit.status != "awaiting_input":
-        raise HTTPException(
-            status_code=409, detail=f"Audit status is {audit.status}"
-        )
+        raise HTTPException(status_code=409, detail=f"Status is {audit.status}")
 
     intent = dict(audit.intent or {})
-    needs = intent.get("needs")
+    if intent.get("needs") != "unit":
+        raise HTTPException(status_code=409, detail="Not a unit clarification")
 
-    if needs == "unit":
-        word = req.value.strip().lower()
-        resolved = UNIT_MAP.get(word)
-        if resolved is None and word.endswith("s"):
-            resolved = UNIT_MAP.get(word[:-1])
-        if resolved is None:
-            return DraftResponse(
-                audit_id=audit.audit_id,
-                needs_input="unit",
-                prompt=(
-                    f"Didn't recognize '{req.value}'. "
-                    f"Try one of: pages, hours, minutes, miles, km, concepts."
-                ),
-            )
-        intent["metric"] = resolved
-        intent.pop("needs", None)
-    else:
-        raise HTTPException(
-            status_code=422, detail=f"Unknown clarification: {needs}"
+    habits = [
+        {"name": h.name, "display_name": h.display_name, "metric": h.metric}
+        for h in db.execute(select(Habit).where(Habit.is_active)).scalars().all()
+    ]
+
+    try:
+        r = httpx.post(
+            f"{settings.llm_base_url}/extract",
+            json={
+                "original_text": audit.user_input,
+                "clarification": req.value,
+                "habits": habits,
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        new_intent = r.json()["intent"]
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
+
+    metric = new_intent.get("metric") or new_intent.get("suggested_metric")
+    if not metric:
+        return DraftResponse(
+            audit_id=audit.audit_id,
+            needs_input="unit",
+            prompt=f"Still need a unit for '{req.value}'. Try again.",
+            draft_sql=audit.draft_sql,
         )
 
+    intent["metric"] = str(metric).strip().lower()
+    intent["metric_source"] = "explicit"
+    if new_intent.get("draft_sql"):
+        intent["draft_sql"] = new_intent["draft_sql"]
+    intent.pop("needs", None)
+
     audit.intent = intent
+    audit.draft_sql = intent.get("draft_sql") or audit.draft_sql
     audit.status = "pending"
     db.commit()
     db.refresh(audit)
 
     habit = db.get(Habit, intent["habit_id"])
     preview = (
-        f"{intent['amount']:g} {intent['metric']} of {habit.display_name} "
-        f"on {intent['log_date']}"
+        f"{intent['amount']:g} {intent['metric']} of "
+        f"{habit.display_name} on {intent['log_date']}"
+    )
+    return DraftResponse(
+        audit_id=audit.audit_id,
+        preview=preview,
+        intent=intent,
+        draft_sql=audit.draft_sql,
+        metric_source="explicit",
     )
 
-    return DraftResponse(audit_id=audit.audit_id, preview=preview, intent=intent)
+
+# ------------------------------------------------------------------
+# /approve_habit — create a proposed habit
+# ------------------------------------------------------------------
+class ApproveHabitRequest(BaseModel):
+    audit_id: int
+    accept: bool
+
+
+@router.post("/approve_habit", response_model=DraftResponse)
+def approve_habit(req: ApproveHabitRequest, db: Session = Depends(get_db)):
+    audit = (
+        db.execute(
+            select(AuditLog)
+            .where(AuditLog.audit_id == req.audit_id)
+            .with_for_update()
+        )
+        .scalar_one_or_none()
+    )
+    if audit is None:
+        raise HTTPException(status_code=404, detail="Audit not found")
+    if audit.status != "awaiting_input":
+        raise HTTPException(status_code=409, detail=f"Status is {audit.status}")
+
+    intent = dict(audit.intent or {})
+    if intent.get("needs") != "habit_approval":
+        raise HTTPException(status_code=409, detail="Not a habit approval")
+
+    if not req.accept:
+        audit.status = "cancelled"
+        db.commit()
+        return DraftResponse(
+            audit_id=audit.audit_id, preview="Cancelled.", draft_sql=audit.draft_sql
+        )
+
+    name = intent["proposed_habit"]
+    default_metric = intent.get("metric") or intent.get("suggested_metric")
+
+    existing = db.execute(select(Habit).where(Habit.name == name)).scalar_one_or_none()
+    if existing:
+        habit = existing
+    else:
+        habit = Habit(
+            name=name,
+            display_name=name.replace("_", " ").title(),
+            metric=default_metric,
+        )
+        db.add(habit)
+        db.flush()
+
+    intent["habit_name"] = name
+    intent["habit_id"] = habit.habit_id
+    intent.pop("proposed_habit", None)
+    intent.pop("needs", None)
+
+    metric = default_metric
+    source = "suggested" if default_metric else "missing"
+
+    if metric is None:
+        intent["needs"] = "unit"
+        audit.intent = intent
+        audit.status = "awaiting_input"
+        db.commit()
+        db.refresh(audit)
+        return DraftResponse(
+            audit_id=audit.audit_id,
+            needs_input="unit",
+            prompt=(
+                f"Created '{habit.display_name}'. What unit for "
+                f"{intent['amount']:g} on {intent['log_date']}?"
+            ),
+            draft_sql=audit.draft_sql,
+        )
+
+    intent["metric"] = metric
+    intent["metric_source"] = source
+    audit.intent = intent
+    audit.status = "pending"
+    db.commit()
+    db.refresh(audit)
+
+    preview = (
+        f"{intent['amount']:g} {intent['metric']} of "
+        f"{habit.display_name} on {intent['log_date']}"
+    )
+    return DraftResponse(
+        audit_id=audit.audit_id,
+        preview=preview,
+        intent=intent,
+        draft_sql=audit.draft_sql,
+        metric_source=source,
+    )
 
 
 # ------------------------------------------------------------------
@@ -210,7 +287,6 @@ def execute(req: ExecuteRequest, db: Session = Depends(get_db)):
 
     if audit.status == "executed":
         return {"status": "already_executed", "log_id": None}
-
     if audit.status != "pending":
         raise HTTPException(status_code=409, detail=f"Audit status is {audit.status}")
 
@@ -250,17 +326,66 @@ def execute(req: ExecuteRequest, db: Session = Depends(get_db)):
 
 
 # ------------------------------------------------------------------
-# /feedback (Phase 6)
+# /feedback — Loop 2 (user correction)
 # ------------------------------------------------------------------
 class FeedbackRequest(BaseModel):
     audit_id: int
     feedback: str
 
 
-@router.post("/feedback")
+@router.post("/feedback", response_model=DraftResponse)
 def feedback(req: FeedbackRequest, db: Session = Depends(get_db)):
-    raise HTTPException(
-        status_code=501, detail="Feedback loop implemented in Phase 6"
+    audit = (
+        db.execute(
+            select(AuditLog)
+            .where(AuditLog.audit_id == req.audit_id)
+            .with_for_update()
+        )
+        .scalar_one_or_none()
+    )
+    if audit is None:
+        raise HTTPException(status_code=404, detail="Audit not found")
+    if audit.status not in ("pending", "awaiting_input"):
+        raise HTTPException(
+            status_code=409, detail=f"Audit status is {audit.status}"
+        )
+
+    audit, clarify_prompt, proposal_prompt = regenerate_from_feedback(
+        audit, req.feedback, db
+    )
+
+    if clarify_prompt:
+        return DraftResponse(
+            audit_id=audit.audit_id,
+            needs_input="unit",
+            prompt=clarify_prompt,
+            draft_sql=audit.draft_sql,
+        )
+    if proposal_prompt:
+        return DraftResponse(
+            audit_id=audit.audit_id,
+            needs_input="habit",
+            prompt=proposal_prompt,
+            draft_sql=audit.draft_sql,
+        )
+    if audit.status == "failed":
+        raise HTTPException(
+            status_code=422,
+            detail=audit.error_message or "Couldn't regenerate from feedback.",
+        )
+
+    habit = db.get(Habit, audit.intent["habit_id"])
+    source = audit.intent.get("metric_source", "explicit")
+    preview = (
+        f"{audit.intent['amount']:g} {audit.intent['metric']} of "
+        f"{habit.display_name} on {audit.intent['log_date']}"
+    )
+    return DraftResponse(
+        audit_id=audit.audit_id,
+        preview=preview,
+        intent=audit.intent,
+        draft_sql=audit.draft_sql,
+        metric_source=source,
     )
 
 

@@ -36,6 +36,37 @@ def authorized(update: Update) -> bool:
     return update.effective_user.id == settings.telegram_allowed_user_id
 
 
+def _escape_md(s: str) -> str:
+    if not s:
+        return s
+    for ch in ("_", "*", "[", "]", "`"):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
+def _card_markup(audit_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=f"approve:{audit_id}"),
+                InlineKeyboardButton(
+                    "✏️ Feedback", callback_data=f"feedback:{audit_id}"
+                ),
+            ]
+        ]
+    )
+
+
+def _format_card(
+    audit_id: int, preview: str, metric_source: str, draft_sql: str | None
+) -> str:
+    suffix = " _(suggested)_" if metric_source == "suggested" else ""
+    body = f"📝 {_escape_md(preview)}{suffix}\n\n_Audit #{audit_id}_"
+    if draft_sql:
+        body += f"\n\n```sql\n{draft_sql.strip()}\n```"
+    return body
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
@@ -52,10 +83,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Send natural language like:\n"
         '  "ran 4 miles today"\n'
-        '  "read 20 pages"\n'
-        '  "meditated 10 minutes"\n\n'
-        "If you forget the unit, I'll ask.\n"
-        "You'll get a verification card before anything is written.\n\n"
+        '  "read 20"\n'
+        '  "learned rust for 2 hours"\n\n'
+        "You'll see the SQL the assistant drafted before anything is written.\n"
+        "Tap ✏️ Feedback to correct the draft — it'll regenerate in place.\n\n"
         "Commands:\n"
         "  /habits — list tracked habits\n"
         "  /stats  — last 30 days totals\n"
@@ -69,15 +100,18 @@ async def habits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(f"{settings.api_base_url}/internal/habits")
-        if r.status_code == 200:
-            habits = r.json()
-            if not habits:
-                await update.message.reply_text("No habits yet.")
-                return
-            lines = [f"• {h['display_name']} ({h['metric']})" for h in habits]
-            await update.message.reply_text("Tracked habits:\n" + "\n".join(lines))
-        else:
+        if r.status_code != 200:
             await update.message.reply_text(f"API error {r.status_code}")
+            return
+        habits = r.json()
+        if not habits:
+            await update.message.reply_text("No habits yet.")
+            return
+        lines = [
+            f"• {h['display_name']} ({h.get('metric') or 'no default unit'})"
+            for h in habits
+        ]
+        await update.message.reply_text("Tracked habits:\n" + "\n".join(lines))
     except Exception as e:
         log.exception("habits call failed")
         await update.message.reply_text(f"Error: {e}")
@@ -117,56 +151,125 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data.pop("awaiting_clarification", None)
     context.user_data.pop("awaiting_feedback_for", None)
+    context.user_data.pop("feedback_card_message_id", None)
     await update.message.reply_text("Cancelled.")
 
 
-async def _send_card(update: Update, audit_id: int, preview: str):
+async def _send_card(
+    update: Update,
+    audit_id: int,
+    preview: str,
+    metric_source: str,
+    draft_sql: str | None,
+):
+    body = _format_card(audit_id, preview, metric_source, draft_sql)
+    try:
+        await update.message.reply_text(
+            body, reply_markup=_card_markup(audit_id), parse_mode="Markdown"
+        )
+    except Exception:
+        await update.message.reply_text(
+            f"📝 {preview}\n\nAudit #{audit_id}"
+            + (f"\n\nSQL:\n{draft_sql.strip()}" if draft_sql else ""),
+            reply_markup=_card_markup(audit_id),
+        )
+
+
+async def _send_habit_card(update: Update, audit_id: int, prompt: str):
     keyboard = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✅ Approve", callback_data=f"approve:{audit_id}"),
-                InlineKeyboardButton("✏️ Feedback", callback_data=f"feedback:{audit_id}"),
+                InlineKeyboardButton(
+                    "✅ Create & Log", callback_data=f"create_habit:{audit_id}"
+                ),
+                InlineKeyboardButton(
+                    "✏️ Cancel", callback_data=f"cancel_habit:{audit_id}"
+                ),
             ]
         ]
     )
-    await update.message.reply_text(
-        f"📝 {preview}\n\nAudit #{audit_id}",
-        reply_markup=keyboard,
-    )
+    await update.message.reply_text(prompt, reply_markup=keyboard)
 
 
-async def _send_feedback(update: Update, audit_id: int, feedback: str):
+async def _send_feedback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, audit_id: int, feedback: str
+):
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
                 f"{settings.api_base_url}/internal/feedback",
                 json={"audit_id": audit_id, "feedback": feedback},
             )
-        if r.status_code == 501:
-            await update.message.reply_text(
-                "Feedback loop implemented in Phase 6. "
-                "For now, send a fresh message to draft again."
-            )
-        elif r.status_code >= 400:
-            await update.message.reply_text(f"API error {r.status_code}: {r.text}")
-        else:
-            await update.message.reply_text("Updated draft.")
     except Exception as e:
         log.exception("feedback call failed")
         await update.message.reply_text(f"Error: {e}")
+        return
+
+    if r.status_code == 501:
+        await update.message.reply_text("Feedback loop not implemented yet.")
+        return
+
+    if r.status_code >= 400:
+        await update.message.reply_text(f"API error {r.status_code}: {r.text}")
+        return
+
+    data = r.json()
+
+    # Still needs input — either a unit or a habit approval
+    if data.get("needs_input") == "unit":
+        context.user_data["awaiting_clarification"] = {"audit_id": data["audit_id"]}
+        await update.message.reply_text(data["prompt"])
+        return
+    if data.get("needs_input") == "habit":
+        await _send_habit_card(update, data["audit_id"], data["prompt"])
+        return
+
+    # Regenerated successfully — edit the original card in place
+    card_body = _format_card(
+        data["audit_id"],
+        data["preview"],
+        data.get("metric_source", "explicit"),
+        data.get("draft_sql"),
+    )
+    markup = _card_markup(data["audit_id"])
+
+    card_message_id = context.user_data.pop("feedback_card_message_id", None)
+    chat_id = update.effective_chat.id
+
+    if card_message_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=card_message_id,
+                text=card_body,
+                reply_markup=markup,
+                parse_mode="Markdown",
+            )
+            return
+        except Exception:
+            pass
+
+    # Fallback: send as a new message
+    try:
+        await update.message.reply_text(
+            card_body, reply_markup=markup, parse_mode="Markdown"
+        )
+    except Exception:
+        await update.message.reply_text(
+            f"📝 {data['preview']}\n\nAudit #{data['audit_id']}",
+            reply_markup=markup,
+        )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
 
-    # 1. Awaiting feedback (Phase 6 stub)
     pending_feedback = context.user_data.pop("awaiting_feedback_for", None)
     if pending_feedback is not None:
-        await _send_feedback(update, pending_feedback, update.message.text)
+        await _send_feedback(update, context, pending_feedback, update.message.text)
         return
 
-    # 2. Awaiting clarification (missing unit, etc.)
     awaiting = context.user_data.get("awaiting_clarification")
     if awaiting is not None:
         audit_id = awaiting["audit_id"]
@@ -189,20 +292,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.get("needs_input"):
             await update.message.reply_text(data["prompt"])
             return
-
         context.user_data.pop("awaiting_clarification", None)
-        await _send_card(update, data["audit_id"], data["preview"])
+        await _send_card(
+            update,
+            data["audit_id"],
+            data["preview"],
+            data.get("metric_source", "explicit"),
+            data.get("draft_sql"),
+        )
         return
-
-    # 3. Fresh message → draft
-    text = update.message.text
-    chat_id = update.effective_chat.id
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
                 f"{settings.api_base_url}/internal/draft",
-                json={"chat_id": chat_id, "text": text},
+                json={
+                    "chat_id": update.effective_chat.id,
+                    "text": update.message.text,
+                },
             )
     except Exception as e:
         log.exception("draft call failed")
@@ -210,24 +317,29 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if r.status_code == 422:
-        detail = r.json().get("detail", "Couldn't understand that.")
-        await update.message.reply_text(detail)
+        await update.message.reply_text(
+            r.json().get("detail", "Couldn't understand.")
+        )
         return
-
     if r.status_code >= 400:
         await update.message.reply_text(f"API error {r.status_code}: {r.text}")
         return
 
     data = r.json()
-
-    if data.get("needs_input"):
-        context.user_data["awaiting_clarification"] = {
-            "audit_id": data["audit_id"],
-        }
+    if data.get("needs_input") == "unit":
+        context.user_data["awaiting_clarification"] = {"audit_id": data["audit_id"]}
         await update.message.reply_text(data["prompt"])
         return
-
-    await _send_card(update, data["audit_id"], data["preview"])
+    if data.get("needs_input") == "habit":
+        await _send_habit_card(update, data["audit_id"], data["prompt"])
+        return
+    await _send_card(
+        update,
+        data["audit_id"],
+        data["preview"],
+        data.get("metric_source", "explicit"),
+        data.get("draft_sql"),
+    )
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -262,7 +374,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if r.status_code == 200:
             data = r.json()
             if data.get("status") == "already_executed":
-                await query.edit_message_text(f"✅ Already logged. Audit #{audit_id}")
+                await query.edit_message_text(
+                    f"✅ Already logged. Audit #{audit_id}"
+                )
             else:
                 await query.edit_message_text(
                     f"✅ Logged. Audit #{audit_id} (log {data.get('log_id')})"
@@ -272,9 +386,62 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "feedback":
         context.user_data["awaiting_feedback_for"] = audit_id
+        context.user_data["feedback_card_message_id"] = query.message.message_id
         await query.edit_message_text(
-            f"Audit #{audit_id} — send feedback as your next message."
+            f"Audit #{audit_id} — send feedback as your next message.\n"
+            f"(e.g. \"no, 6 miles yesterday\" or \"wrong habit, it was reading\")"
         )
+
+    elif action == "create_habit":
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(
+                    f"{settings.api_base_url}/internal/approve_habit",
+                    json={"audit_id": audit_id, "accept": True},
+                )
+        except Exception as e:
+            log.exception("approve_habit call failed")
+            await query.edit_message_text(f"Error: {e}")
+            return
+
+        if r.status_code >= 400:
+            await query.edit_message_text(f"❌ {r.status_code}: {r.text}")
+            return
+
+        data = r.json()
+        if data.get("needs_input") == "unit":
+            context.user_data["awaiting_clarification"] = {"audit_id": audit_id}
+            await query.edit_message_text(data["prompt"])
+            return
+
+        body = _format_card(
+            audit_id,
+            data["preview"],
+            data.get("metric_source", "explicit"),
+            data.get("draft_sql"),
+        )
+        try:
+            await query.edit_message_text(
+                f"✅ Habit created.\n\n{body}",
+                reply_markup=_card_markup(audit_id),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            await query.edit_message_text(
+                f"✅ Habit created.\n\n📝 {data['preview']}\n\nAudit #{audit_id}",
+                reply_markup=_card_markup(audit_id),
+            )
+
+    elif action == "cancel_habit":
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                await client.post(
+                    f"{settings.api_base_url}/internal/approve_habit",
+                    json={"audit_id": audit_id, "accept": False},
+                )
+        except Exception:
+            pass
+        await query.edit_message_text(f"Cancelled. Audit #{audit_id}")
 
 
 async def on_startup(app: Application):

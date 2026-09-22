@@ -1,0 +1,117 @@
+# ============================================================
+# HabitFlow — semantic model for the LLM
+# The LLM reads this to understand the schema and produce SQL.
+# ============================================================
+
+tables:
+  - name: habits
+    description: "Habit definitions. One row per habit."
+    columns:
+      - name: habit_id
+        type: SERIAL
+        primary_key: true
+      - name: name
+        type: VARCHAR(100)
+        description: "internal identifier, lowercase, snake_case (e.g. 'learning_sql')"
+      - name: display_name
+        type: TEXT
+        description: "human-readable name (e.g. 'Learning SQL')"
+      - name: metric
+        type: VARCHAR(50)
+        nullable: true
+        description: "default unit; NULL if none is natural"
+      - name: is_active
+        type: BOOLEAN
+        description: "only active habits are loggable"
+
+  - name: daily_logs
+    description: "One row per logged event. Append-only."
+    columns:
+      - name: log_id
+        type: BIGSERIAL
+        primary_key: true
+      - name: habit_id
+        type: INTEGER
+        foreign_key: habits.habit_id
+      - name: amount
+        type: NUMERIC(10,2)
+        description: "must be > 0"
+      - name: metric
+        type: VARCHAR(50)
+        description: "unit for THIS log, not the habit's default"
+      - name: logged_at
+        type: TIMESTAMPTZ
+        description: "exact moment; defaults to NOW()"
+      - name: log_date
+        type: DATE
+        description: "YYYY-MM-DD in user's timezone (Asia/Kolkata)"
+      - name: source
+        type: VARCHAR(20)
+        description: "'manual' | 'llm' | 'import' | 'api'"
+      - name: audit_id
+        type: BIGINT
+        foreign_key: audit_log.audit_id
+
+  - name: audit_log
+    description: "LLM session trace."
+    columns:
+      - name: audit_id
+        type: BIGSERIAL
+        primary_key: true
+      - name: chat_id
+        type: BIGINT
+      - name: user_input
+        type: TEXT
+      - name: intent
+        type: JSONB
+      - name: status
+        type: VARCHAR(20)
+        description: "'pending' | 'awaiting_input' | 'approved' | 'executed' | 'failed' | 'cancelled' | 'superseded'"
+
+# ------------------------------------------------------------
+# Intent contract
+# ------------------------------------------------------------
+intent_shape:
+  habit_name: "string matching a known habit, or null"
+  proposed_habit: "short lowercase snake_case name for a new habit, or null"
+  amount: "positive number, or null"
+  metric: "lowercase string the user explicitly said, or null"
+  suggested_metric: "recommended unit when metric is null, or null"
+  log_date: "YYYY-MM-DD"
+  confidence: "0.0 to 1.0"
+  draft_sql: "a valid Postgres INSERT into daily_logs using :named placeholders for amount/metric/log_date"
+
+# ------------------------------------------------------------
+# Rules
+# ------------------------------------------------------------
+rules:
+  - "amount must be a positive number"
+  - "log_date must be YYYY-MM-DD, never in the future"
+  - "metric: the unit the user EXPLICITLY mentioned, lowercase, or null"
+  - "suggested_metric: when metric is null, your best guess based on habit default or recently used unit"
+  - "if no known habit matches, propose a short lowercase snake_case name in proposed_habit"
+  - "habit_name must match a name from KNOWN HABITS or be null"
+  - "draft_sql: INSERT INTO daily_logs with a subquery to look up habit_id by name"
+  - "draft_sql: use :amount, :metric, :log_date as named placeholders"
+  - "never use DROP, DELETE, UPDATE, or TRUNCATE"
+  - "return ONLY the JSON object, no markdown"
+
+# ------------------------------------------------------------
+# SQL style — examples the LLM should follow
+# ------------------------------------------------------------
+sql_examples:
+  - intent: "log 4 miles of running today"
+    draft_sql: |
+      INSERT INTO daily_logs (habit_id, amount, metric, log_date, source)
+      VALUES (
+        (SELECT habit_id FROM habits WHERE name = 'running'),
+        :amount, :metric, :log_date, 'llm'
+      )
+
+  - intent: "log 20 pages of reading"
+    draft_sql: |
+      INSERT INTO daily_logs (habit_id, amount, metric, log_date, source)
+      VALUES (
+        (SELECT habit_id FROM habits WHERE name = 'reading'),
+        :amount, :metric, :log_date, 'llm'
+      )

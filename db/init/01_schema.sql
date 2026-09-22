@@ -4,17 +4,14 @@
 -- Analytics (medallion) built later as views, not columns.
 -- ============================================================
 
--- ------------------------------------------------------------
--- habits — the definitions
--- ------------------------------------------------------------
 CREATE TABLE habits (
     habit_id       SERIAL       PRIMARY KEY,
     name           VARCHAR(100) UNIQUE NOT NULL,
     display_name   TEXT         NOT NULL,
     description    TEXT,
-    metric         VARCHAR(50)  NOT NULL,      -- default unit: pages, hours, etc.
+    metric         VARCHAR(50),                 -- default unit; NULL if none is natural
     target_value   NUMERIC(10,2),
-    target_metric  VARCHAR(50),                -- unit for the target
+    target_metric  VARCHAR(50),
     is_active      BOOLEAN      NOT NULL DEFAULT TRUE,
     created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
@@ -25,27 +22,20 @@ CREATE TABLE habits (
         CHECK ((target_value IS NULL) = (target_metric IS NULL))
 );
 
--- ------------------------------------------------------------
--- audit_log — every LLM session, in full
--- Created before daily_logs so daily_logs can FK to it.
--- ------------------------------------------------------------
 CREATE TABLE audit_log (
     audit_id         BIGSERIAL    PRIMARY KEY,
     chat_id          BIGINT       NOT NULL,
     message_id       BIGINT,
 
-    -- raw session
     user_input       TEXT         NOT NULL,
     received_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
 
-    -- LLM trace
     intent           JSONB,
     draft_sql        TEXT,
     error_message    TEXT,
     user_feedback    TEXT,
     final_sql        TEXT,
 
-    -- outcome
     iteration_count  INTEGER      NOT NULL DEFAULT 0,
     status           VARCHAR(20)  NOT NULL DEFAULT 'pending',
     duration_ms      INTEGER,
@@ -54,11 +44,10 @@ CREATE TABLE audit_log (
     updated_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_audit_status
-    CHECK (status IN (
-        'pending', 'awaiting_input',
-        'approved', 'executed', 'failed', 'cancelled', 'superseded'
-    ))
-
+        CHECK (status IN (
+            'pending', 'awaiting_input',
+            'approved', 'executed', 'failed', 'cancelled', 'superseded'
+        ))
 );
 
 CREATE INDEX idx_audit_chat_status
@@ -67,21 +56,17 @@ CREATE INDEX idx_audit_chat_status
 CREATE INDEX idx_audit_created
     ON audit_log (created_at DESC);
 
--- Only one pending card per chat at a time.
 CREATE UNIQUE INDEX uq_audit_pending_per_chat
     ON audit_log (chat_id)
     WHERE status = 'pending';
 
--- ------------------------------------------------------------
--- daily_logs — what actually got logged
--- ------------------------------------------------------------
 CREATE TABLE daily_logs (
     log_id           BIGSERIAL     PRIMARY KEY,
     habit_id         INTEGER       NOT NULL REFERENCES habits(habit_id),
     amount           NUMERIC(10,2) NOT NULL,
-    metric           VARCHAR(50)   NOT NULL,     -- unit used for THIS log
+    metric           VARCHAR(50)   NOT NULL,     -- required per log
     logged_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
-    log_date         DATE          NOT NULL,     -- date in user's timezone
+    log_date         DATE          NOT NULL,
     source           VARCHAR(20)   NOT NULL DEFAULT 'manual',
     raw_input        TEXT,
     audit_id         BIGINT        REFERENCES audit_log(audit_id),
@@ -104,9 +89,6 @@ CREATE INDEX idx_daily_logs_audit
     ON daily_logs (audit_id)
     WHERE audit_id IS NOT NULL;
 
--- ------------------------------------------------------------
--- Triggers — updated_at
--- ------------------------------------------------------------
 CREATE OR REPLACE FUNCTION set_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN

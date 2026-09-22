@@ -15,12 +15,20 @@ services:
       timeout: 5s
       retries: 10
 
+  llm:
+    build: ./llm
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - api
+
   api:
     build: ./api
     restart: unless-stopped
     env_file: .env
     environment:
       DATABASE_URL: ${DATABASE_URL}
+      LLM_BASE_URL: http://llm:9000
     depends_on:
       db:
         condition: service_healthy
