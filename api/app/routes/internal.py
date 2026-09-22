@@ -1,10 +1,9 @@
-import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from app.config import settings
+from app import drafting
 from app.db import get_db
 from app.drafting import regenerate_from_feedback, run_loop1
 from app.models import AuditLog, DailyLog, Habit
@@ -117,23 +116,12 @@ def clarify(req: ClarifyRequest, db: Session = Depends(get_db)):
     if intent.get("needs") != "unit":
         raise HTTPException(status_code=409, detail="Not a unit clarification")
 
-    habits = [
-        {"name": h.name, "display_name": h.display_name, "metric": h.metric}
-        for h in db.execute(select(Habit).where(Habit.is_active)).scalars().all()
-    ]
-
     try:
-        r = httpx.post(
-            f"{settings.llm_base_url}/extract",
-            json={
-                "original_text": audit.user_input,
-                "clarification": req.value,
-                "habits": habits,
-            },
-            timeout=30,
+        new_intent = drafting.call_llm(
+            original_text=audit.user_input,
+            clarification=req.value,
+            habits=drafting.habits_context(db),
         )
-        r.raise_for_status()
-        new_intent = r.json()["intent"]
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
 
@@ -152,6 +140,7 @@ def clarify(req: ClarifyRequest, db: Session = Depends(get_db)):
         intent["draft_sql"] = new_intent["draft_sql"]
     intent.pop("needs", None)
 
+    drafting.supersede_pending(audit.chat_id, db, keep_audit_id=audit.audit_id)
     audit.intent = intent
     audit.draft_sql = intent.get("draft_sql") or audit.draft_sql
     audit.status = "pending"
@@ -247,6 +236,7 @@ def approve_habit(req: ApproveHabitRequest, db: Session = Depends(get_db)):
 
     intent["metric"] = metric
     intent["metric_source"] = source
+    drafting.supersede_pending(audit.chat_id, db, keep_audit_id=audit.audit_id)
     audit.intent = intent
     audit.status = "pending"
     db.commit()

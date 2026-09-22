@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     groq_api_key: str
     groq_model_name: str = "llama-3.3-70b-versatile"
     groq_base_url: str = "https://api.groq.com/openai/v1"
+    app_timezone: str = "Asia/Kolkata"
 
 
 settings = Settings()

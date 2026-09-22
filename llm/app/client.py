@@ -1,7 +1,8 @@
 import json
-from datetime import date, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import yaml
 from openai import OpenAI
@@ -57,8 +58,9 @@ def _build_system_prompt(habits: list[dict]) -> str:
     )
 
     shape = json.dumps(SEMANTICS.get("intent_shape", {}), indent=2)
-    today = date.today().isoformat()
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    local_today = datetime.now(ZoneInfo(settings.app_timezone)).date()
+    today = local_today.isoformat()
+    yesterday = (local_today - timedelta(days=1)).isoformat()
 
     return f"""You are a Text-to-Intent + SQL engine for a personal habit tracker.
 

@@ -1,3 +1,5 @@
+import math
+import re
 from datetime import date
 from typing import Optional
 
@@ -7,9 +9,10 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import AuditLog, Habit
+from app.timeutil import today
 
 
-def _habits_context(db: Session) -> list[dict]:
+def habits_context(db: Session) -> list[dict]:
     habits = db.execute(select(Habit).where(Habit.is_active)).scalars().all()
     recent_rows = db.execute(
         text(
@@ -32,8 +35,12 @@ def _habits_context(db: Session) -> list[dict]:
     ]
 
 
-def _call_llm(**kwargs) -> dict:
-    r = httpx.post(f"{settings.llm_base_url}/extract", json=kwargs, timeout=30)
+def call_llm(**kwargs) -> dict:
+    r = httpx.post(
+        f"{settings.llm_base_url}/extract",
+        json=kwargs,
+        timeout=settings.llm_timeout_seconds,
+    )
     r.raise_for_status()
     return r.json()["intent"]
 
@@ -48,11 +55,12 @@ def _dry_run_sql(db: Session, sql: str) -> Optional[str]:
         if f" {word} " in f" {lowered} ":
             return f"forbidden operation: {word}"
 
-    import re
     test_sql = re.sub(r":[a-zA-Z_][a-zA-Z0-9_]*", "NULL", sql)
 
     try:
-        db.execute(text(f"EXPLAIN {test_sql}"))
+        # Savepoint: a failing EXPLAIN must not abort the caller's transaction.
+        with db.begin_nested():
+            db.execute(text(f"EXPLAIN {test_sql}"))
         return None
     except Exception as e:
         return str(e).split("\n")[0]
@@ -65,7 +73,7 @@ def _valid_date(s: Optional[str]) -> bool:
         d = date.fromisoformat(s)
     except (ValueError, TypeError):
         return False
-    return d <= date.today()
+    return d <= today()
 
 
 def _normalize_metric(m) -> Optional[str]:
@@ -82,9 +90,13 @@ def _validate(intent: dict, db: Session) -> tuple[bool, Optional[str], Optional[
     if not habit_name and not proposed:
         return False, "Could not match a habit or propose a new one.", None
 
-    amount = intent.get("amount")
-    if amount is None or float(amount) <= 0:
+    try:
+        amount = float(intent.get("amount"))
+    except (TypeError, ValueError):
+        return False, f"Amount must be a number, got {intent.get('amount')!r}.", None
+    if not math.isfinite(amount) or amount <= 0:
         return False, "Amount must be a positive number.", None
+    intent["amount"] = amount
 
     if not _valid_date(intent.get("log_date")):
         return False, f"Invalid date: {intent.get('log_date')}", None
@@ -119,13 +131,15 @@ def _validate(intent: dict, db: Session) -> tuple[bool, Optional[str], Optional[
     return True, None, habit
 
 
-def _supersede_pending(chat_id: int, db: Session):
-    db.execute(
-        update(AuditLog)
-        .where(AuditLog.chat_id == chat_id, AuditLog.status == "pending")
-        .values(status="superseded")
+def supersede_pending(chat_id: int, db: Session, keep_audit_id: Optional[int] = None):
+    """Enforce one pending draft per chat (uq_audit_pending_per_chat).
+    Call before moving a row to 'pending'; the caller commits."""
+    stmt = update(AuditLog).where(
+        AuditLog.chat_id == chat_id, AuditLog.status == "pending"
     )
-    db.commit()
+    if keep_audit_id is not None:
+        stmt = stmt.where(AuditLog.audit_id != keep_audit_id)
+    db.execute(stmt.values(status="superseded"))
 
 
 def _resolve_metric(intent: dict) -> tuple[Optional[str], str]:
@@ -142,15 +156,16 @@ def run_loop1(
     db: Session,
     max_retries: int = 3,
 ) -> tuple[AuditLog, Optional[str], Optional[str]]:
-    _supersede_pending(chat_id, db)
+    supersede_pending(chat_id, db)
+    db.commit()
 
-    habits = _habits_context(db)
+    habits = habits_context(db)
     intent: Optional[dict] = None
     error: Optional[str] = None
 
     for attempt in range(1, max_retries + 1):
         try:
-            intent = _call_llm(
+            intent = call_llm(
                 user_text=user_text,
                 habits=habits,
                 previous_intent=intent,
@@ -272,7 +287,7 @@ def regenerate_from_feedback(
     Loop 2: regenerate the intent for an existing audit row based on user feedback.
     Returns (audit, clarify_prompt, proposal_prompt), same shape as run_loop1.
     """
-    habits = _habits_context(db)
+    habits = habits_context(db)
     intent: Optional[dict] = None
     last_intent: Optional[dict] = None
     error: Optional[str] = None
@@ -289,7 +304,7 @@ def regenerate_from_feedback(
                 kwargs["previous_intent"] = last_intent
                 kwargs["previous_error"] = error
 
-            intent = _call_llm(**kwargs)
+            intent = call_llm(**kwargs)
         except Exception as e:
             error = f"LLM call failed: {e}"
             continue
@@ -352,6 +367,7 @@ def regenerate_from_feedback(
                 "metric_source": source,
                 "attempts": base_iteration + attempt,
             }
+            supersede_pending(audit.chat_id, db, keep_audit_id=audit.audit_id)
             audit.draft_sql = intent.get("draft_sql")
             audit.user_feedback = feedback
             audit.iteration_count = base_iteration + attempt

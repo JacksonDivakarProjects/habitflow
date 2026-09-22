@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     telegram_bot_token: str
     telegram_allowed_user_id: int
     api_base_url: str = "http://api:8000"
+    # Calls that hit the LLM: API worst case is 3 retries x LLM_TIMEOUT_SECONDS (20s).
+    api_llm_timeout_seconds: float = 90
 
 
 settings = Settings()
@@ -195,7 +197,7 @@ async def _send_feedback(
     update: Update, context: ContextTypes.DEFAULT_TYPE, audit_id: int, feedback: str
 ):
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=settings.api_llm_timeout_seconds) as client:
             r = await client.post(
                 f"{settings.api_base_url}/internal/feedback",
                 json={"audit_id": audit_id, "feedback": feedback},
@@ -274,18 +276,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if awaiting is not None:
         audit_id = awaiting["audit_id"]
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=settings.api_llm_timeout_seconds) as client:
                 r = await client.post(
                     f"{settings.api_base_url}/internal/clarify",
                     json={"audit_id": audit_id, "value": update.message.text},
                 )
         except Exception as e:
             log.exception("clarify call failed")
-            await update.message.reply_text(f"Error: {e}")
+            await update.message.reply_text(f"Error: {e}\nReply again, or /cancel.")
             return
 
+        if r.status_code in (404, 409):
+            # The audit is gone or no longer waiting on us; stop routing here.
+            context.user_data.pop("awaiting_clarification", None)
+            await update.message.reply_text(
+                "That question has expired. Send your log again."
+            )
+            return
         if r.status_code >= 400:
-            await update.message.reply_text(f"API error {r.status_code}: {r.text}")
+            await update.message.reply_text(
+                f"API error {r.status_code}: {r.text}\nReply again, or /cancel."
+            )
             return
 
         data = r.json()
@@ -303,7 +314,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=settings.api_llm_timeout_seconds) as client:
             r = await client.post(
                 f"{settings.api_base_url}/internal/draft",
                 json={
