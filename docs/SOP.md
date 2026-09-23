@@ -323,6 +323,60 @@ volume. The images are built for the architecture of the machine that built
 them (usually `amd64`); for an ARM server build with
 `docker buildx build --platform linux/arm64` or use a matching machine.
 
+### The single image (one container)
+
+`jackdiva/habitflow:all-<tag>` runs **everything in one container**: Postgres 16,
+the LLM service, the API and the bot, under a small supervisor
+(`allinone/run_all.py`) that starts them in order, restarts any that crash
+and shuts them down cleanly. The API and database listen inside the
+container only; nothing is published.
+
+**Run it** (`.env` needs only `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USER_ID`,
+`GROQ_API_KEY`, and optionally `APP_TIMEZONE` / `GROQ_MODEL_NAME`; **no
+`DATABASE_URL`**):
+
+```bash
+docker run -d --name habitflow --restart unless-stopped \
+  -v habitflow_data:/data --env-file .env jackdiva/habitflow:all-1.1.0
+docker logs -f habitflow          # "[supervisor] bot is healthy", then message the bot
+```
+
+or `docker compose -f docker-compose.single.yml up -d`.
+
+- **Keep the `/data` volume.** It *is* your database. Without `-v …:/data`
+  the data lives in an anonymous volume and is lost with the container.
+- **Backups:** `docker exec habitflow habitflow-backup > backup-$(date +%F).sql`.
+  Restore into a fresh container with
+  `docker exec -i habitflow psql -h /run/postgresql -U habitflow habitflow < backup.sql`.
+- **Upgrades:** `docker pull` the new tag, `docker rm -f habitflow`, and run
+  it again with the same volume. Migrations apply on start.
+- **Your own Postgres instead:** set `DATABASE_URL` (any of `postgres://`,
+  `postgresql://` or `postgresql+psycopg://`). The built-in database is then
+  not started.
+- **Debugging:** `docker exec habitflow ps -ef` shows the four processes; the
+  log lines tagged `[supervisor]` show starts, crashes and restarts.
+
+**Moving your existing compose data into it.** The single image can adopt
+the `habitflow_pgdata` volume from the four-container setup:
+
+```bash
+docker compose down                         # in the old setup; keeps the volume
+docker exec ... habitflow-backup            # (take a backup first, from either setup)
+docker run -d --name habitflow --restart unless-stopped \
+  -v habitflow_pgdata:/data/pgdata \
+  -e POSTGRES_USER=<same as your .env> -e POSTGRES_DB=<same as your .env> \
+  --env-file .env.single jackdiva/habitflow:all-1.1.0
+```
+
+Here `.env.single` is your `.env` without `DATABASE_URL`. The volume is used
+in place: Postgres 16 data is required, and the supervisor rebuilds indexes
+if the text collation ever differs.
+
+**On Render:** `render.yaml` deploys the single image as one Background
+Worker (Starter) with a 1 GB disk at `/data`. That's the whole app on one
+paid instance, and Render snapshots the disk daily. Dashboard → New →
+Blueprint → this repo, then enter the three secrets.
+
 ---
 
 ## 6. Troubleshooting

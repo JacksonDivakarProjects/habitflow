@@ -114,6 +114,10 @@ The compose file names the images `jackdiva/habitflow:api-<tag>`,
 for publishing them and deploying on a server with just the compose file
 and `.env`.
 
+Or run **everything in one container**, Postgres included, from
+`jackdiva/habitflow:all-<tag>` (`allinone/`, `docker-compose.single.yml`,
+`render.yaml`): see [the single image](docs/SOP.md#the-single-image-one-container).
+
 ## Using the bot
 
 | Send | Result |

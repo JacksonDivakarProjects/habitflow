@@ -101,3 +101,33 @@ jobs:
           cache-dependency-path: "**/requirements*.txt"
       - run: pip install -r ../api/requirements.txt -r ../bot/requirements.txt pytest==9.1.1
       - run: pytest -q
+
+  allinone:
+    # The single image: build it, run it with its built-in database, draft a log.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f allinone/Dockerfile -t habitflow-all .
+      - name: Run with the built-in database
+        run: |
+          printf 'TELEGRAM_BOT_TOKEN=1:ci\nTELEGRAM_ALLOWED_USER_ID=1\nGROQ_API_KEY=ci\nGROQ_BASE_URL=http://127.0.0.1:9/v1\n' > ci.env
+          docker run -d --name hf -v hf-data:/data --env-file ci.env habitflow-all
+          for i in $(seq 60); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' hf)" = healthy ] && break; sleep 2
+          done
+          docker inspect -f '{{.State.Health.Status}}' hf | grep -q healthy || { docker logs hf; exit 1; }
+      - name: Draft a log through the API (offline parser, no Groq)
+        run: |
+          docker exec hf python -c "
+          import json, urllib.request
+          req = urllib.request.Request('http://127.0.0.1:8000/internal/draft', method='POST',
+                data=json.dumps({'chat_id': 1, 'text': 'ran 3 miles'}).encode(),
+                headers={'content-type': 'application/json'})
+          body = json.load(urllib.request.urlopen(req, timeout=60))
+          assert body['preview'] == '3 miles of Running today', body
+          print(body['preview'])"
+      - name: Clean shutdown
+        run: |
+          docker stop -t 40 hf
+          test "$(docker inspect -f '{{.State.ExitCode}}' hf)" = 0
+          docker logs hf 2>&1 | grep -q "database system is shut down"
