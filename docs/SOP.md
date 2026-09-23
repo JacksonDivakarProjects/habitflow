@@ -360,8 +360,9 @@ or `docker compose -f docker-compose.single.yml up -d`.
 the `habitflow_pgdata` volume from the four-container setup:
 
 ```bash
-docker compose down                         # in the old setup; keeps the volume
-docker exec ... habitflow-backup            # (take a backup first, from either setup)
+# in the old setup: back up first, then stop it (the volume is kept)
+docker compose exec db pg_dump -U <POSTGRES_USER> <POSTGRES_DB> > backup-before-move.sql
+docker compose down
 docker run -d --name habitflow --restart unless-stopped \
   -v habitflow_pgdata:/data/pgdata \
   -e POSTGRES_USER=<same as your .env> -e POSTGRES_DB=<same as your .env> \
