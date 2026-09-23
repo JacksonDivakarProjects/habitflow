@@ -341,7 +341,8 @@ docker run -d --name habitflow --restart unless-stopped \
 docker logs -f habitflow          # "[supervisor] bot is healthy", then message the bot
 ```
 
-or `docker compose -f docker-compose.single.yml up -d`.
+or `docker compose --env-file .env.single -f docker-compose.single.yml up -d`
+(settings in `.env.single`, copied from `.env.single.example`).
 
 - **Keep the `/data` volume.** It *is* your database. Without `-v …:/data`
   the data lives in an anonymous volume and is lost with the container.
@@ -373,10 +374,8 @@ Here `.env.single` is your `.env` without `DATABASE_URL`. The volume is used
 in place: Postgres 16 data is required, and the supervisor rebuilds indexes
 if the text collation ever differs.
 
-**On Render:** `render.yaml` deploys the single image as one Background
-Worker (Starter) with a 1 GB disk at `/data`. That's the whole app on one
-paid instance, and Render snapshots the disk daily. Dashboard → New →
-Blueprint → this repo, then enter the three secrets.
+**On Render:** create a free Web Service from the image with its settings
+from `.env.single.example`; see the README section "Deploy on Render for free".
 
 ### Using Neon (managed Postgres) instead
 
@@ -390,7 +389,7 @@ CU-hours of compute a month, and a 6-hour restore window.
 2. Copy the **direct** connection string (Connect → not the `-pooler` one):
    `postgresql://neondb_owner:…@ep-….neon.tech/neondb?sslmode=require&channel_binding=require`
 3. Put it in `.env` as `DATABASE_URL=…` and start the single image **without
-   a `/data` volume**, or set it as the `DATABASE_URL` secret in `render.yaml`.
+   a `/data` volume**, or set it as `DATABASE_URL` in the Render service's Environment.
    The API creates the schema on first start.
 
 **Staying inside the free compute.** Neon sleeps after 5 minutes with no open

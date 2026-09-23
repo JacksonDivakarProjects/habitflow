@@ -1,17 +1,19 @@
 # HabitFlow as ONE container: Postgres + llm + api + bot (jackdiva/habitflow:all-<tag>).
+# A separate system from docker-compose.yml: its own project name, settings
+# file (.env.single) and volume, so both can run on the same machine.
 #
-#   docker compose -f docker-compose.single.yml up -d          # pull the image
-#   docker compose -f docker-compose.single.yml up -d --build  # or build it from source
+#   cp .env.single.example .env.single    # fill it in
+#   docker compose --env-file .env.single -f docker-compose.single.yml up -d          # pull the image
+#   docker compose --env-file .env.single -f docker-compose.single.yml up -d --build  # or build it
 #
-# .env: TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID, GROQ_API_KEY (and optionally
-# APP_TIMEZONE, GROQ_MODEL_NAME, HABITFLOW_TAG). Leave DATABASE_URL OUT to use the
-# built-in database; set it only to use an external Postgres.
+# With DATABASE_URL set (e.g. Neon) the built-in database isn't used; without
+# it, the data lives in the habitflow-single_data volume.
 #
-# Same equivalent without compose:
-#   docker run -d --name habitflow --restart unless-stopped \
-#     -v habitflow_data:/data --env-file .env jackdiva/habitflow:all-<tag>
+# Same thing without compose:
+#   docker run -d --name habitflow-single --restart unless-stopped \
+#     -v habitflow-single_data:/data --env-file .env.single jackdiva/habitflow:all-<tag>
 
-name: habitflow
+name: habitflow-single
 
 services:
   habitflow:
@@ -20,9 +22,9 @@ services:
       context: .
       dockerfile: allinone/Dockerfile
     restart: unless-stopped
-    env_file: .env
+    env_file: .env.single     # copy .env.single.example; separate from the compose .env
     volumes:
-      - data:/data            # the built-in database; keep this volume
+      - data:/data            # the built-in database (unused when DATABASE_URL is set)
     stop_grace_period: 40s    # let Postgres shut down cleanly
     # Nothing is published: the API and database listen inside the container only.
 
