@@ -1,31 +1,37 @@
-# Render Blueprint: HabitFlow as ONE Background Worker, data in Neon Postgres.
+# Render Blueprint: HabitFlow as ONE free Web Service, data in Neon Postgres.
 # Dashboard -> New -> Blueprint -> pick this repo. Render asks for the four
 # secrets marked `sync: false`.
 #
 # DATABASE_URL: your Neon connection string (Neon console -> Connect), e.g.
 #   postgresql://neondb_owner:<password>@ep-xxxx.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
-# Keep the worker in the Neon database's region: ap-southeast-1 -> singapore, us-east-2 -> ohio.
-# Use the direct connection string, not the "-pooler" one; the API opens one
-# connection per request for Neon, so it can scale to zero between uses.
+# Keep the service in the Neon database's region: ap-southeast-1 -> singapore, us-east-2 -> ohio.
+# Use the direct connection string, not the "-pooler" one.
 #
-# With DATABASE_URL set, the image doesn't start its built-in Postgres, so the
-# worker stores nothing itself: no disk needed, and redeploys lose nothing.
+# Free web services:
+#   - must listen on $PORT: the container serves a status page there ("/" and
+#     "/healthz" only; the API stays private inside the container);
+#   - sleep after 15 min without inbound HTTP requests: the container requests
+#     its own public URL every 10 min (keep-awake) so the bot and reminders
+#     keep running. One service running all month uses ~730 of the 750 free
+#     hours, so don't run a second free service in the same workspace;
+#   - have a temporary filesystem: DATABASE_URL (Neon) is required, the
+#     built-in database would be wiped on every deploy.
 #
-# Prefer the built-in database on a Render disk instead? Remove DATABASE_URL
-# and add under the service:
-#     disk:
-#       name: habitflow-data
-#       mountPath: /data
-#       sizeGB: 1
+# If Render won't offer the free plan for a prebuilt image, build from the repo
+# instead: replace `runtime: image` + `image:` with
+#     runtime: docker
+#     dockerfilePath: ./allinone/Dockerfile
+#     dockerContext: .
 
 services:
-  - type: worker
+  - type: web
     name: habitflow
     runtime: image
     image:
-      url: docker.io/jackdiva/habitflow:all-1.1.0
-    plan: 0.5c-512mb          # Starter; the app uses ~150 MB without its database
+      url: docker.io/jackdiva/habitflow:all-1.2.0
+    plan: free
     region: singapore         # same place as the Neon database (aws ap-southeast-1)
+    healthCheckPath: /healthz # 200 once the API is up
     envVars:
       - key: DATABASE_URL     # Neon connection string: entered in the Render dashboard,
         sync: false           # never written here (this file is public on GitHub)
