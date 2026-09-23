@@ -1,0 +1,36 @@
+# Render Blueprint: HabitFlow as ONE Background Worker with a persistent disk.
+# Dashboard -> New -> Blueprint -> pick this repo. Render asks for the three
+# secrets marked `sync: false`.
+#
+# The image runs Postgres, the LLM service, the API and the bot together; the
+# database lives on the disk at /data (Render snapshots disks daily). A worker
+# is used because the bot polls Telegram and needs no inbound traffic, and
+# nothing inside is exposed.
+#
+# Prefer a managed database instead? Add a `databases:` entry and set
+# DATABASE_URL from it (fromDatabase ... connectionString); the image then
+# skips its built-in Postgres and you can drop the disk.
+
+services:
+  - type: worker
+    name: habitflow
+    runtime: image
+    image:
+      url: docker.io/jackdiva/habitflow:all-1.1.0
+    plan: 0.5c-512mb          # Starter; everything uses ~250 MB
+    region: singapore         # closest to Asia/Kolkata
+    disk:
+      name: habitflow-data
+      mountPath: /data        # the built-in database; without it data is lost on deploy
+      sizeGB: 1
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ALLOWED_USER_ID
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL_NAME
+        value: llama-3.3-70b-versatile
+      - key: APP_TIMEZONE
+        value: Asia/Kolkata

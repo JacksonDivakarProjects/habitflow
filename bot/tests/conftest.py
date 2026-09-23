@@ -104,6 +104,11 @@ class FakeJobQueue:
         self.jobs.append(job)
         return job
 
+    def run_once(self, callback, when, name=None):
+        job = FakeJob(name, callback=callback, when=when)
+        self.jobs.append(job)
+        return job
+
     def get_jobs_by_name(self, name):
         return [j for j in self.jobs if j.name == name and not j.removed]
 

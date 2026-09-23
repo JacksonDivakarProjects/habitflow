@@ -1,0 +1,11 @@
+#!/bin/sh
+# SQL dump of the HabitFlow database to stdout, in either mode:
+#   docker exec habitflow habitflow-backup > backup-$(date +%F).sql
+# Restore into a fresh container:
+#   docker exec -i habitflow psql -h /run/postgresql -U habitflow habitflow < backup.sql
+set -eu
+if [ -n "${DATABASE_URL:-}" ]; then
+  # external database: pg_dump wants a plain libpq URL
+  exec pg_dump --no-owner "$(echo "$DATABASE_URL" | sed 's#^postgresql+psycopg://#postgresql://#; s#^postgres://#postgresql://#')"
+fi
+exec pg_dump --no-owner -h /run/postgresql -U "${POSTGRES_USER:-habitflow}" "${POSTGRES_DB:-habitflow}"

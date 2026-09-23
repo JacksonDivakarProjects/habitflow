@@ -354,13 +354,32 @@ def test_startup_schedules_enabled_reminders_only(api):
     assert [j.kwargs["chat_id"] for j in app.job_queue.active()] == [1]
 
 
-def test_startup_survives_api_being_down(api):
-    api.on("GET", "/health", raises=httpx.ConnectError("down"))
+def test_startup_retries_reminders_while_api_is_down(api):
+    api.on("GET", "/internal/reminders", raises=httpx.ConnectError("down"))
     app = SimpleNamespace(bot=SimpleNamespace(set_my_commands=AsyncMock()), job_queue=FakeJobQueue())
 
     run(bot.on_startup(app))  # must not raise
 
-    assert app.job_queue.active() == []
+    [retry] = app.job_queue.active()
+    assert (retry.name, retry.kwargs["when"]) == ("reminder-sync", bot.REMINDER_RETRY_SECONDS)
+
+
+def test_reminder_retry_schedules_once_api_is_back(api):
+    api.on("GET", "/internal/reminders", json=[{"chat_id": 1, "remind_at": "21:00", "enabled": True}])
+    jq = FakeJobQueue()
+
+    run(bot._retry_load_reminders(SimpleNamespace(job_queue=jq)))
+
+    assert [j.name for j in jq.active()] == ["reminder:1"]  # scheduled, no further retry
+
+
+def test_reminder_retry_keeps_retrying(api):
+    api.on("GET", "/internal/reminders", status=503, json={})
+    jq = FakeJobQueue()
+
+    run(bot._retry_load_reminders(SimpleNamespace(job_queue=jq)))
+
+    assert [j.name for j in jq.active()] == ["reminder-sync"]
 
 
 @pytest.mark.parametrize(
