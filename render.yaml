@@ -1,15 +1,22 @@
-# Render Blueprint: HabitFlow as ONE Background Worker with a persistent disk.
-# Dashboard -> New -> Blueprint -> pick this repo. Render asks for the three
+# Render Blueprint: HabitFlow as ONE Background Worker, data in Neon Postgres.
+# Dashboard -> New -> Blueprint -> pick this repo. Render asks for the four
 # secrets marked `sync: false`.
 #
-# The image runs Postgres, the LLM service, the API and the bot together; the
-# database lives on the disk at /data (Render snapshots disks daily). A worker
-# is used because the bot polls Telegram and needs no inbound traffic, and
-# nothing inside is exposed.
+# DATABASE_URL: your Neon connection string (Neon console -> Connect), e.g.
+#   postgresql://neondb_owner:...@ep-xxxx.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
+# Pick the Neon region closest to this worker (Singapore: aws ap-southeast-1).
+# Use the direct connection string, not the "-pooler" one; the API opens one
+# connection per request for Neon, so it can scale to zero between uses.
 #
-# Prefer a managed database instead? Add a `databases:` entry and set
-# DATABASE_URL from it (fromDatabase ... connectionString); the image then
-# skips its built-in Postgres and you can drop the disk.
+# With DATABASE_URL set, the image doesn't start its built-in Postgres, so the
+# worker stores nothing itself: no disk needed, and redeploys lose nothing.
+#
+# Prefer the built-in database on a Render disk instead? Remove DATABASE_URL
+# and add under the service:
+#     disk:
+#       name: habitflow-data
+#       mountPath: /data
+#       sizeGB: 1
 
 services:
   - type: worker
@@ -17,13 +24,11 @@ services:
     runtime: image
     image:
       url: docker.io/jackdiva/habitflow:all-1.1.0
-    plan: 0.5c-512mb          # Starter; everything uses ~250 MB
-    region: singapore         # closest to Asia/Kolkata
-    disk:
-      name: habitflow-data
-      mountPath: /data        # the built-in database; without it data is lost on deploy
-      sizeGB: 1
+    plan: 0.5c-512mb          # Starter; the app uses ~150 MB without its database
+    region: singapore
     envVars:
+      - key: DATABASE_URL
+        sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_ALLOWED_USER_ID

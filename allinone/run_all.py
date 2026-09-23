@@ -203,7 +203,9 @@ def build_processes(env: dict) -> list[Proc]:
         Proc("api", "/app/api",
              [sys.executable, "-m", "uvicorn", "app.main:app", "--host", API_HOST,
               "--port", "8000", "--log-level", "warning"],
-             http_ok("http://127.0.0.1:8000/health/db")),
+             # /health: up means startup (migrations) succeeded, without opening a
+             # DB connection each time (a serverless database must be able to sleep)
+             http_ok("http://127.0.0.1:8000/health")),
         Proc("bot", "/app/bot", [sys.executable, "bot.py"], lambda: True),
     ]
     return procs

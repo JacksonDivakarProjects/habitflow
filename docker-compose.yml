@@ -51,8 +51,8 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:8000:8000"  # only reachable from this machine; /internal has no auth
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/db')"]
+    healthcheck:  # /health, not /health/db: lets a serverless DATABASE_URL (Neon) sleep
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
       timeout: 5s
       retries: 5

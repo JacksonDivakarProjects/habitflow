@@ -9,6 +9,9 @@ class Settings(BaseSettings):
     llm_base_url: str = "http://llm:9000"
     llm_timeout_seconds: float = 20
     app_timezone: str = "Asia/Kolkata"
+    # "auto": no connection pool for serverless Postgres (Neon) so it can sleep;
+    # "on"/"off" to force it.
+    database_pool: str = "auto"
 
     @field_validator("database_url")
     @classmethod

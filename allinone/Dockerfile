@@ -56,8 +56,10 @@ COPY --chmod=755 allinone/habitflow-backup /usr/local/bin/habitflow-backup
 # The embedded database lives here; without a volume it's lost with the container.
 VOLUME ["/data"]
 
+# /health, not /health/db: a serverless database (Neon) must be allowed to sleep.
+# The API only answers after startup, and startup runs the migrations.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/db')"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
 
 STOPSIGNAL SIGTERM
 CMD ["python", "/app/run_all.py"]
