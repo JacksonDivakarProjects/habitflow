@@ -117,6 +117,28 @@ def ensure_database():
     if _psql(f"SELECT 1 FROM pg_database WHERE datname = '{PG_DB}'") != "1":
         log.info("creating database %s", PG_DB)
         _psql(f'CREATE DATABASE "{PG_DB}" OWNER "{PG_USER}"')
+    refresh_collation_if_needed(PG_DB)
+
+
+def refresh_collation_if_needed(db: str):
+    """Data made under another glibc may sort text differently: rebuild the
+    indexes and record the new version, as Postgres itself recommends."""
+    row = _psql(
+        "SELECT datcollversion || '|' || pg_database_collation_actual_version(oid) "
+        f"FROM pg_database WHERE datname = '{db}' AND datcollversion IS NOT NULL"
+    )
+    if not row:
+        return  # C / no-locale database: nothing depends on glibc
+    stored, actual = row.split("|")
+    if stored == actual:
+        return
+    log.warning("database %s: collation %s, system has %s: reindexing", db, stored, actual)
+    for sql in (f'REINDEX DATABASE "{db}"', f'ALTER DATABASE "{db}" REFRESH COLLATION VERSION'):
+        subprocess.run(
+            [f"{PG_BIN}/psql", "-h", PG_SOCKET_DIR, "-U", PG_USER, "-d", db, "-tAc", sql],
+            check=True, capture_output=True,
+        )
+    log.info("database %s: indexes rebuilt for collation %s", db, actual)
 
 
 # ------------------------------------------------------------------

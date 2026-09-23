@@ -7,14 +7,18 @@
 # set it to use an external Postgres instead (e.g. Render Postgres).
 # Build from the repo root:  docker build -f allinone/Dockerfile -t jackdiva/habitflow:all-<tag> .
 
-# Pinned Debian release, so the Postgres major version never changes under your data.
-FROM python:3.12-slim-trixie
+# Debian bookworm, like the official postgres:16.4 image: the same glibc means
+# the same text collation, so data volumes from the compose setup can be
+# adopted as-is. Pinned so nothing changes under your data between builds.
+FROM python:3.12-slim-bookworm
 
 ARG PG_MAJOR=16
 # Postgres from the official PGDG apt repo; no default cluster (we create ours in /data).
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl; \
+    apt-get install -y --no-install-recommends ca-certificates curl locales; \
+    # en_US.UTF-8: postgres:16.4 creates databases with it (adopted volumes need it)
+    localedef -i en_US -c -f UTF-8 -A /usr/share/locale/locale.alias en_US.UTF-8; \
     install -d /usr/share/postgresql-common/pgdg /etc/postgresql-common; \
     curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
       -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc; \
