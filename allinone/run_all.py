@@ -117,7 +117,9 @@ def ensure_database():
     if _psql(f"SELECT 1 FROM pg_database WHERE datname = '{PG_DB}'") != "1":
         log.info("creating database %s", PG_DB)
         _psql(f'CREATE DATABASE "{PG_DB}" OWNER "{PG_USER}"')
-    refresh_collation_if_needed(PG_DB)
+    # All of them (incl. postgres/template1), or every health check logs a warning.
+    for db in _psql("SELECT datname FROM pg_database WHERE datallowconn").split():
+        refresh_collation_if_needed(db)
 
 
 def refresh_collation_if_needed(db: str):
