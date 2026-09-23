@@ -131,3 +131,17 @@ jobs:
           docker stop -t 40 hf
           test "$(docker inspect -f '{{.State.ExitCode}}' hf)" = 0
           docker logs hf 2>&1 | grep -q "database system is shut down"
+      - name: Render free web-service mode (PORT set, 0.1 CPU)
+        run: |
+          docker run -d --name hfweb --cpus 0.1 --memory 512m -p 127.0.0.1:10000:10000 \
+            -e PORT=10000 -e RENDER_EXTERNAL_URL=http://127.0.0.1:10000 -e KEEP_AWAKE_MINUTES=0.2 \
+            --env-file ci.env habitflow-all
+          for i in $(seq 90); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:10000/healthz)" = 200 ] && break; sleep 2
+          done
+          curl -sf http://127.0.0.1:10000/ | grep -q "HabitFlow is running"
+          curl -sf http://127.0.0.1:10000/healthz | python3 -c 'import sys,json; assert json.load(sys.stdin)["status"] == "ok"'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:10000/internal/habits)" = 404
+          sleep 20
+          curl -s http://127.0.0.1:10000/healthz | python3 -c 'import sys,json; assert json.load(sys.stdin)["keep_awake"]["pings_ok"] >= 1'
+          docker stop -t 30 hfweb

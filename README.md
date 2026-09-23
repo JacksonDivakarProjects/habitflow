@@ -116,56 +116,27 @@ and `.env`.
 
 Or run **everything in one container**, Postgres included, from
 `jackdiva/habitflow:all-<tag>` (`allinone/`, `docker-compose.single.yml`,
-`render.yaml`): see [the single image](docs/SOP.md#the-single-image-one-container).
+`.env.single.example`): see [the single image](docs/SOP.md#the-single-image-one-container), and
+[deploy it on Render for free](#deploy-on-render-for-free-single-container--neon).
 
-## Deploy on Render (single container + Neon)
+## Deploy on Render for free (single container + Neon)
 
-This runs the whole app as **one Render Background Worker** from the
-`jackdiva/habitflow:all-<tag>` image, with the data in **Neon** Postgres. The
-worker stores nothing itself, so redeploys can't lose data. It's independent
-of the docker compose setup: that one keeps using `.env` and its own
-database.
+This runs the whole app as **one free Render Web Service** straight from the
+`jackdiva/habitflow:all-<tag>` image on Docker Hub, with the data in **Neon**
+Postgres (also free). No Blueprint and no repo connection are needed: you
+create the service in the dashboard and paste in the settings from
+[`.env.single.example`](.env.single.example). The service stores nothing
+itself, so redeploys can't lose data. It's independent of the docker compose
+setup, which keeps using `.env` and its own database.
 
-### How `render.yaml` works
+### How the image fits Render's free web services
 
-`render.yaml` is a Render **Blueprint**: a description of the services Render
-should create. When you connect the repo, Render reads it and creates what
-it describes.
-
-```yaml
-services:
-  - type: worker                  # Background Worker: always on, no public URL.
-                                  #   The bot polls Telegram, so nothing needs to reach it.
-    name: habitflow
-    runtime: image                # run a prebuilt image instead of building the repo
-    image:
-      url: docker.io/jackdiva/habitflow:all-1.1.0   # the single image (Postgres + llm + api + bot)
-    plan: 0.5c-512mb              # "Starter": 0.5 CPU, 512 MB (the app uses ~150 MB)
-    region: singapore             # keep it next to the Neon database (ap-southeast-1)
-    envVars:
-      - key: DATABASE_URL         # sync: false = Render asks for the value when you
-        sync: false               #   create the Blueprint and stores it itself.
-      - key: TELEGRAM_BOT_TOKEN   #   Nothing secret is ever written in this file
-        sync: false               #   (it's public on GitHub; a test fails CI if it is).
-      - key: TELEGRAM_ALLOWED_USER_ID
-        sync: false
-      - key: GROQ_API_KEY
-        sync: false
-      - key: GROQ_MODEL_NAME      # plain values, safe to keep in the file
-        value: llama-3.3-70b-versatile
-      - key: APP_TIMEZONE
-        value: Asia/Kolkata
-```
-
-Because `DATABASE_URL` is set, the image **doesn't start its built-in
-Postgres**. The API creates the tables in Neon on first start, and a
-supervisor inside the container starts llm → api → bot in order and
-restarts anything that crashes.
-
-**Syncing:** Render re-applies the Blueprint whenever you push a change to
-`render.yaml` on the linked branch (*Auto Sync*, on by default). A new image
-is **not** picked up by itself: bump the tag in `render.yaml` and push, or
-use *Manual Deploy*.
+| Render free web service rule | What the image does |
+|---|---|
+| Must listen on `$PORT` (Render sets it) | Serves a status page there: `/` ("HabitFlow is running.") and `/healthz` (JSON). Nothing else is public; the API and `/internal/*` stay on 127.0.0.1 inside the container |
+| Sleeps after 15 min without inbound HTTP requests | The bot polls Telegram, which is outbound. So every 10 minutes the container requests its own public URL (`RENDER_EXTERNAL_URL`, set by Render) and stays awake, and the bot and 9 pm reminders keep working. `/healthz` shows `keep_awake.pings_ok` |
+| Temporary filesystem, wiped on deploys | `DATABASE_URL` points at Neon, so the built-in database isn't used. Without it, the logs warn loudly |
+| 750 free hours a month per workspace | One service awake all month uses about 730 hours. Don't run a second free service in the same workspace |
 
 ### Before you deploy (once)
 
@@ -177,73 +148,100 @@ use *Manual Deploy*.
    the token. Telegram lets only one program read a bot's messages, so don't
    reuse the token of a bot that runs somewhere else (like the compose setup).
 3. **Your Telegram user id** (from @userinfobot) and **a Groq API key**.
-4. **The image on Docker Hub.** `jackdiva/habitflow:all-1.1.0` must exist and
-   be public (from the repo, logged in as jackdiva):
-   ```bash
-   docker build -f allinone/Dockerfile -t jackdiva/habitflow:all-1.1.0 .
-   docker push jackdiva/habitflow:all-1.1.0
-   ```
-5. **`render.yaml` pushed to GitHub**, on the branch you'll deploy from.
+4. **Your settings file.** Copy `.env.single.example` to `.env.single` on your
+   PC and fill in the four required values. It's gitignored; never commit it.
 
 ### Deploy
 
-1. Open <https://dashboard.render.com> → **New** → **Blueprint**.
-2. Connect GitHub and pick the **habitflow** repository, then **Connect**.
-3. Give the Blueprint a name (e.g. `habitflow`) and choose the **branch**
-   that has `render.yaml`.
-4. Render lists one resource, the **habitflow** worker. Fill in the four
-   secrets it asks for:
+1. Open <https://dashboard.render.com> → **+ New** → **Web Service**.
+2. Under **Source Code**, choose **Existing Image**. For **Image URL** enter
+   `docker.io/jackdiva/habitflow:all-1.2.0` (public, so no credentials),
+   then **Connect**.
+3. Fill in:
+
+   | Field | Value |
+   |---|---|
+   | **Name** | `habitflow` (your URL becomes `https://habitflow-xxxx.onrender.com`) |
+   | **Region** | **Singapore**, next to the Neon database |
+   | **Instance Type** | **Free** |
+
+4. **Environment Variables:** click **Add from .env** and paste your
+   `.env.single`, or add the four one by one:
 
    | Key | Value |
    |---|---|
-   | `DATABASE_URL` | the Neon **direct** connection string from step 1 |
+   | `DATABASE_URL` | the Neon **direct** connection string |
    | `TELEGRAM_BOT_TOKEN` | the Render bot's token |
    | `TELEGRAM_ALLOWED_USER_ID` | your numeric Telegram id |
    | `GROQ_API_KEY` | your Groq key |
 
-5. Click **Deploy Blueprint**. Render needs a payment method for the Starter
-   plan.
+   Don't add `PORT`: Render sets it (10000).
+5. **Advanced** → **Health Check Path**: `/healthz`.
+6. Click **Deploy Web Service**.
+
+If the **Free** instance type isn't offered for an image, create the Web
+Service from the **Git repository** instead, with **Language: Docker**,
+**Dockerfile Path** `./allinone/Dockerfile` and **Docker Build Context
+Directory** `.`. Everything else is the same; Render builds the image itself.
 
 ### Check that it works
 
-Open the worker → **Logs**. Within a minute you should see:
+- Open `https://<your-service>.onrender.com/` → `HabitFlow is running.`
+- Open `…/healthz` → `"status": "ok"`, all processes `true`.
+- **Logs** show:
+  ```
+  [supervisor] web service mode: status page on port 10000 (only / and /healthz are public)
+  [supervisor] DATABASE_URL is set: using the external database
+  [supervisor] keep-awake: requesting https://<your-service>.onrender.com/ every 10 min ...
+  [supervisor] api is healthy
+  ... Bot polling...
+  ```
+- Message your Render bot `/start`, then log something (`ran 3 miles`). In
+  Neon's *Tables* view, `habits`, `daily_logs`, `audit_log`,
+  `reminder_settings` and `schema_migrations` now exist.
 
-```
-[supervisor] DATABASE_URL is set: using the external database
-[supervisor] llm is healthy
-[supervisor] api is healthy
-[supervisor] started bot
-... Bot polling...
-```
-
-Then message your Render bot `/start` and log something (`ran 3 miles`). In
-Neon's *Tables* view, `habits`, `daily_logs`, `audit_log`,
-`reminder_settings` and `schema_migrations` now exist.
+Startup takes a minute or two on the free instance (0.1 CPU). **Optional
+backup for keep-awake:** a free monitor such as [UptimeRobot](https://uptimerobot.com)
+or [cron-job.org](https://cron-job.org) requesting your `/` URL every 5–10
+minutes wakes the service if Render ever puts it to sleep.
 
 ### Day to day
 
 | Task | How |
 |---|---|
-| **Deploy a new version** | Publish a new tag (e.g. `all-1.2.0`), change `image.url` in `render.yaml`, commit and push. Auto Sync redeploys. |
-| **Redeploy the same tag** | Worker → **Manual Deploy** → *Deploy latest reference* |
-| **Roll back** | Put the previous tag back in `render.yaml` and push |
-| **Change a secret** (e.g. a new Neon password) | Worker → **Environment** → edit → *Save changes* (Render restarts it) |
-| **Logs** | Worker → **Logs**; `[supervisor]` lines show starts, crashes and restarts |
-| **Backup** | Neon keeps 6 h of history on the free plan. For more, open the worker's **Shell** and run `habitflow-backup > /tmp/backup.sql`, or use `pg_dump` from your PC with the same URL |
-| **Stop it** | Worker → **Settings** → *Suspend* (no charges while suspended) |
+| **Deploy a new version** | Publish a new tag (e.g. `all-1.3.0`, see below). Service → **Settings** → **Image URL** → new tag, then **Manual Deploy** → *Deploy latest reference* |
+| **Redeploy the same tag** | **Manual Deploy** → *Deploy latest reference* (Render pulls the image again) |
+| **Roll back** | Put the previous tag back in **Image URL** and deploy |
+| **Change a setting or secret** (e.g. a new Neon password) | Service → **Environment** → edit → *Save and deploy* |
+| **Logs** | Service → **Logs**; `[supervisor]` lines show starts, crashes, restarts and keep-awake problems |
+| **Backup** | Neon keeps 6 h of history on the free plan. For older copies, run `pg_dump` from your PC with the same URL |
+| **Stop it** | Service → **Settings** → *Suspend* |
 
-**Cost:** the Starter worker (Render bills per second; roughly $7 a month
-always on). Neon's free plan covers the database: the app closes its
-connections after a quiet minute, so Neon sleeps between uses.
+**Publishing a new image** (from the repo, logged in to Docker Hub as jackdiva):
+
+```bash
+docker build -f allinone/Dockerfile -t jackdiva/habitflow:all-<tag> .
+docker push jackdiva/habitflow:all-<tag>
+```
+
+Render keeps no copy of pulled images, so keep every tag you deploy on
+Docker Hub.
+
+**Cost:** $0. Render's free web service plus Neon's free plan. The app
+closes its Neon connections after a quiet minute, so Neon sleeps between
+uses and stays within its free compute.
 
 ### If something's wrong
 
-| Symptom in the logs | Cause and fix |
+| Symptom | Cause and fix |
 |---|---|
 | `Conflict: terminated by other getUpdates request` | The same bot token is running somewhere else. Stop the other copy or use a separate bot for Render |
 | `api exited with 3 while starting` repeating | The database can't be reached. Check `DATABASE_URL` (direct address, `sslmode=require`) and that the Neon project isn't suspended |
 | `password authentication failed` | The Neon password changed. Update `DATABASE_URL` under **Environment** |
-| Image pull failed | `jackdiva/habitflow:all-<tag>` doesn't exist or the repository is private: push it, or add registry credentials in Render |
+| Deploy stuck on the health check | Startup is slow on 0.1 CPU. Wait a couple of minutes, then check the logs for which process isn't healthy |
+| Bot stops answering after a while | The service fell asleep: check `/healthz` → `keep_awake.last_error`, and add an UptimeRobot monitor as a backup |
+| Service suspended near month end | The workspace ran out of its 750 free hours (another free service is using them) |
+| Image pull failed | The tag doesn't exist on Docker Hub, or the repository was made private |
 | Bot doesn't answer, no errors | `TELEGRAM_ALLOWED_USER_ID` isn't your id (other users are silently ignored) |
 | Every card says "AI is offline" | Bad `GROQ_API_KEY`, or Groq is rate limiting |
 

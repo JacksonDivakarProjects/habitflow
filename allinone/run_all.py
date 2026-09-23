@@ -14,17 +14,31 @@ before what it depends on. Any process that exits is restarted with
 exponential backoff (1s .. 60s). SIGTERM/SIGINT stops everything cleanly
 (Postgres gets a fast, checkpointed shutdown) and exits 0.
 
-With DATABASE_URL set (e.g. Render Postgres) the embedded database is skipped.
+With DATABASE_URL set (e.g. Neon) the embedded database is skipped.
+
+Web-service mode (Render free web services, anything that sets $PORT):
+  - a tiny public HTTP server on $PORT serves ONLY "/" (a status line) and
+    "/healthz" (JSON, 200 once the API is up, 503 while starting). The API
+    itself stays on 127.0.0.1 and is never exposed.
+  - keep-awake: free web services sleep after 15 minutes without inbound
+    HTTP traffic, and the bot's Telegram polling is outbound. Every
+    KEEP_AWAKE_MINUTES (10) the container requests its own public URL
+    (RENDER_EXTERNAL_URL, or KEEP_AWAKE_URL) so it stays awake and the bot
+    and reminders keep running. KEEP_AWAKE=0 turns it off.
 """
 
+import json
 import logging
 import os
 import pwd
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 logging.basicConfig(format="%(asctime)s [supervisor] %(message)s", level=logging.INFO)
 log = logging.getLogger("supervisor")
@@ -40,6 +54,15 @@ API_HOST = os.environ.get("API_HOST", "127.0.0.1")
 HEALTH_TIMEOUT = float(os.environ.get("STARTUP_HEALTH_TIMEOUT", "120"))
 MAX_BACKOFF = 60.0
 STABLE_AFTER = 60.0  # seconds up before a crash counts as "new" again
+
+PUBLIC_PORT = os.environ.get("PORT")  # Render sets it for web services (default 10000)
+INTERNAL_PORTS = {"8000", "9000"}
+KEEP_AWAKE = os.environ.get("KEEP_AWAKE", "1") != "0"
+KEEP_AWAKE_URL = os.environ.get("KEEP_AWAKE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+KEEP_AWAKE_MINUTES = float(os.environ.get("KEEP_AWAKE_MINUTES", "10"))
+
+STATUS = {"started": time.time(), "procs": [], "pings_ok": 0, "last_ping": None,
+          "last_ping_error": None}
 
 
 # ------------------------------------------------------------------
@@ -144,6 +167,99 @@ def refresh_collation_if_needed(db: str):
 
 
 # ------------------------------------------------------------------
+# Web-service mode: public status page + keep-awake
+# ------------------------------------------------------------------
+api_healthy = http_ok("http://127.0.0.1:8000/health")
+
+
+class PublicHandler(BaseHTTPRequestHandler):
+    """Only "/" and "/healthz" exist publicly; everything else is 404."""
+
+    def _send(self, code: int, body: str, ctype: str = "application/json"):
+        data = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/":
+            self._send(200, "HabitFlow is running.\n", "text/plain; charset=utf-8")
+        elif path == "/healthz":
+            ok = api_healthy()
+            self._send(200 if ok else 503, json.dumps({
+                "status": "ok" if ok else "starting",
+                "uptime_s": int(time.time() - STATUS["started"]),
+                "processes": {p.name: p.running() for p in STATUS["procs"]},
+                "keep_awake": {"enabled": bool(KEEP_AWAKE and KEEP_AWAKE_URL),
+                               "pings_ok": STATUS["pings_ok"],
+                               "last_ping": STATUS["last_ping"],
+                               "last_error": STATUS["last_ping_error"]},
+            }))
+        else:
+            self._send(404, '{"detail": "not found"}')
+
+    do_HEAD = do_GET
+
+    def log_message(self, *_):  # keep health checks and pings out of the logs
+        pass
+
+
+def start_public_server():
+    if not PUBLIC_PORT:
+        return
+    if PUBLIC_PORT in INTERNAL_PORTS:
+        sys.exit(f"PORT={PUBLIC_PORT} is used inside the container; pick another (e.g. 10000)")
+    server = ThreadingHTTPServer(("0.0.0.0", int(PUBLIC_PORT)), PublicHandler)
+    threading.Thread(target=server.serve_forever, name="public-http", daemon=True).start()
+    log.info("web service mode: status page on port %s (only / and /healthz are public)",
+             PUBLIC_PORT)
+
+
+def start_keep_awake(stopping):
+    if not (PUBLIC_PORT and KEEP_AWAKE):
+        return
+    if not KEEP_AWAKE_URL:
+        log.info("keep-awake off: no RENDER_EXTERNAL_URL / KEEP_AWAKE_URL")
+        return
+    url = KEEP_AWAKE_URL.rstrip("/") + "/"
+    log.info("keep-awake: requesting %s every %g min (free web services sleep after "
+             "15 min without inbound traffic)", url, KEEP_AWAKE_MINUTES)
+
+    def loop():
+        while not stopping():
+            deadline = time.monotonic() + KEEP_AWAKE_MINUTES * 60
+            while time.monotonic() < deadline and not stopping():
+                time.sleep(1)
+            if stopping():
+                return
+            try:
+                with urllib.request.urlopen(url, timeout=30) as r:
+                    r.read()
+                STATUS["pings_ok"] += 1
+                STATUS["last_ping"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                STATUS["last_ping_error"] = None
+            except Exception as e:
+                STATUS["last_ping_error"] = str(e)
+                log.warning("keep-awake request failed: %s", e)
+
+    threading.Thread(target=loop, name="keep-awake", daemon=True).start()
+
+
+def warn_if_data_is_ephemeral(env: dict):
+    if os.environ.get("RENDER") and not env.get("DATABASE_URL"):
+        log.warning("!" * 70)
+        log.warning("Running on Render WITHOUT DATABASE_URL: the built-in database lives on")
+        log.warning("Render's temporary filesystem and is WIPED on every deploy and restart.")
+        log.warning("Set DATABASE_URL (e.g. your Neon connection string) in the service settings.")
+        log.warning("!" * 70)
+
+
+# ------------------------------------------------------------------
 # Process supervision
 # ------------------------------------------------------------------
 class Proc:
@@ -223,7 +339,11 @@ def main() -> int:
     stopping = lambda: stop["flag"]  # noqa: E731
 
     env = dict(os.environ)
+    start_public_server()  # first, so a platform waiting for $PORT sees it at once
+    warn_if_data_is_ephemeral(env)
     procs = build_processes(env)
+    STATUS["procs"] = procs
+    start_keep_awake(stopping)
     for proc in procs:
         if stopping():
             break
