@@ -761,26 +761,45 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+REMINDER_RETRY_SECONDS = 30
+
+
+async def load_reminders(job_queue) -> bool:
+    """Schedule every enabled reminder stored in the API. False if unreachable."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(f"{settings.api_base_url}/internal/reminders")
+        r.raise_for_status()
+        reminders = r.json()
+    except Exception as e:
+        log.warning("could not load reminders (retrying in %ss): %s", REMINDER_RETRY_SECONDS, e)
+        return False
+    for item in reminders:
+        if item["enabled"]:
+            schedule_reminder(job_queue, item["chat_id"], item["remind_at"])
+            log.info("reminder scheduled for %s at %s", item["chat_id"], item["remind_at"])
+    return True
+
+
+async def _retry_load_reminders(context: ContextTypes.DEFAULT_TYPE):
+    if not await load_reminders(context.job_queue):
+        context.job_queue.run_once(
+            _retry_load_reminders, REMINDER_RETRY_SECONDS, name="reminder-sync"
+        )
+
+
 async def on_startup(app: Application):
     try:
         await app.bot.set_my_commands([BotCommand(n, d) for n, d in COMMANDS])
     except Exception as e:
         log.warning("could not set command menu: %s", e)
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(f"{settings.api_base_url}/health")
-            log.info("API health: %s", r.json())
-            reminders = (await client.get(f"{settings.api_base_url}/internal/reminders")).json()
-    except Exception as e:
-        log.warning("API not reachable on startup: %s", e)
-        return
     if app.job_queue is None:
         log.warning("job queue unavailable; install python-telegram-bot[job-queue]")
         return
-    for item in reminders:
-        if item["enabled"]:
-            schedule_reminder(app.job_queue, item["chat_id"], item["remind_at"])
-            log.info("reminder scheduled for %s at %s", item["chat_id"], item["remind_at"])
+    # The API may still be starting (no startup ordering on some hosts):
+    # keep trying in the background instead of silently scheduling nothing.
+    if not await load_reminders(app.job_queue):
+        app.job_queue.run_once(_retry_load_reminders, REMINDER_RETRY_SECONDS, name="reminder-sync")
 
 
 def main():

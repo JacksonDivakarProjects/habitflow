@@ -16,7 +16,7 @@ Telegram ──> bot ──HTTP──> api ──HTTP──> llm ──> Groq (L
 | `bot/` | Telegram front end (python-telegram-bot). Single allowed user. |
 | `api/` | FastAPI. Drafting loop, validation, approval state machine, writes. |
 | `llm/` | FastAPI wrapper around Groq. Builds the prompt from `semantics.yaml`. |
-| `db/init/` | Schema and seed data, applied when the Postgres volume is first created. |
+| `api/migrations/` | The whole schema and starter habits, applied by the API at startup. |
 
 **Setting it up, using it, running it or fixing it?** See the
 [usage guide and SOP](docs/SOP.md), including how
@@ -48,9 +48,15 @@ under *Not included* with the reason, so you can send it on its own.
 original card stays approvable and you can simply try again. Every
 correction is recorded in the draft's `feedback_history`.
 
-**Units.** Names are normalized ("Mins" becomes minutes, "mi" becomes
-miles). Totals convert within a family (km and miles, minutes and hours,
-ml and liters), so "5 km" and "1 mile" add up in `/stats`.
+**Units.** The LLM decides the unit before anything is stored: it
+normalizes names ("mins" becomes minutes), reads ambiguous ones from the
+habit ("500 m" of running is meters, "30m" of meditation is minutes), and
+suggests one when you didn't say it, including a sensible default for a new
+habit (pushups become reps). The rules and examples are in the `units`
+section of `llm/semantics.yaml`. The API then re-checks every answer with
+the same rules (`api/app/units.py`) and shows the result on the card for
+you to approve. Totals convert within a family (km and miles, minutes and
+hours, ml and liters), so "5 km" and "1 mile" add up in `/stats`.
 
 **AI offline.** If the LLM is unreachable, simple messages about known
 habits ("ran 3 miles yesterday") and simple corrections ("6 km, not 4",
@@ -92,11 +98,154 @@ The interactive docs are at <http://localhost:8000/docs>.
 
 ### Schema changes
 
-`db/init/*.sql` is the baseline and only runs when the `pgdata` volume is
-empty. Later changes go in `api/migrations/NNNN_name.sql`. The API applies
-each file once, in order, at startup, and records it in
-`schema_migrations`, so an existing database is upgraded in place. Write
-migrations to be idempotent (`IF NOT EXISTS`).
+The whole schema lives in `api/migrations/`, starting with
+`0000_baseline.sql` and `0000_seed_habits.sql`. The API applies each file
+once, in order, at startup, and records it in `schema_migrations`. A fresh
+Postgres therefore needs nothing mounted, and an existing database
+(including one created by the old `db/init` scripts) is upgraded in place.
+New changes go in `api/migrations/NNNN_name.sql` and must be idempotent
+(`IF NOT EXISTS`); `api/tests/test_deploy.py` checks all three cases.
+
+### Docker images
+
+The compose file names the images `jackdiva/habitflow:api-<tag>`,
+`:llm-<tag>` and `:bot-<tag>` (override with `HABITFLOW_IMAGE` /
+`HABITFLOW_TAG`). See [docs/SOP.md](docs/SOP.md#publishing-to-docker-hub)
+for publishing them and deploying on a server with just the compose file
+and `.env`.
+
+Or run **everything in one container**, Postgres included, from
+`jackdiva/habitflow:all-<tag>` (`allinone/`, `docker-compose.single.yml`,
+`render.yaml`): see [the single image](docs/SOP.md#the-single-image-one-container).
+
+## Deploy on Render (single container + Neon)
+
+This runs the whole app as **one Render Background Worker** from the
+`jackdiva/habitflow:all-<tag>` image, with the data in **Neon** Postgres. The
+worker stores nothing itself, so redeploys can't lose data. It's independent
+of the docker compose setup: that one keeps using `.env` and its own
+database.
+
+### How `render.yaml` works
+
+`render.yaml` is a Render **Blueprint**: a description of the services Render
+should create. When you connect the repo, Render reads it and creates what
+it describes.
+
+```yaml
+services:
+  - type: worker                  # Background Worker: always on, no public URL.
+                                  #   The bot polls Telegram, so nothing needs to reach it.
+    name: habitflow
+    runtime: image                # run a prebuilt image instead of building the repo
+    image:
+      url: docker.io/jackdiva/habitflow:all-1.1.0   # the single image (Postgres + llm + api + bot)
+    plan: 0.5c-512mb              # "Starter": 0.5 CPU, 512 MB (the app uses ~150 MB)
+    region: singapore             # keep it next to the Neon database (ap-southeast-1)
+    envVars:
+      - key: DATABASE_URL         # sync: false = Render asks for the value when you
+        sync: false               #   create the Blueprint and stores it itself.
+      - key: TELEGRAM_BOT_TOKEN   #   Nothing secret is ever written in this file
+        sync: false               #   (it's public on GitHub; a test fails CI if it is).
+      - key: TELEGRAM_ALLOWED_USER_ID
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL_NAME      # plain values, safe to keep in the file
+        value: llama-3.3-70b-versatile
+      - key: APP_TIMEZONE
+        value: Asia/Kolkata
+```
+
+Because `DATABASE_URL` is set, the image **doesn't start its built-in
+Postgres**. The API creates the tables in Neon on first start, and a
+supervisor inside the container starts llm → api → bot in order and
+restarts anything that crashes.
+
+**Syncing:** Render re-applies the Blueprint whenever you push a change to
+`render.yaml` on the linked branch (*Auto Sync*, on by default). A new image
+is **not** picked up by itself: bump the tag in `render.yaml` and push, or
+use *Manual Deploy*.
+
+### Before you deploy (once)
+
+1. **Neon database.** Create a project at <https://neon.com> in **AWS
+   Singapore (ap-southeast-1)**. Copy the connection string from *Connect*
+   and remove `-pooler` from the host to get the direct address:
+   `postgresql://neondb_owner:<password>@ep-….c-4.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require`
+2. **A Telegram bot just for Render.** In @BotFather send `/newbot` and keep
+   the token. Telegram lets only one program read a bot's messages, so don't
+   reuse the token of a bot that runs somewhere else (like the compose setup).
+3. **Your Telegram user id** (from @userinfobot) and **a Groq API key**.
+4. **The image on Docker Hub.** `jackdiva/habitflow:all-1.1.0` must exist and
+   be public (from the repo, logged in as jackdiva):
+   ```bash
+   docker build -f allinone/Dockerfile -t jackdiva/habitflow:all-1.1.0 .
+   docker push jackdiva/habitflow:all-1.1.0
+   ```
+5. **`render.yaml` pushed to GitHub**, on the branch you'll deploy from.
+
+### Deploy
+
+1. Open <https://dashboard.render.com> → **New** → **Blueprint**.
+2. Connect GitHub and pick the **habitflow** repository, then **Connect**.
+3. Give the Blueprint a name (e.g. `habitflow`) and choose the **branch**
+   that has `render.yaml`.
+4. Render lists one resource, the **habitflow** worker. Fill in the four
+   secrets it asks for:
+
+   | Key | Value |
+   |---|---|
+   | `DATABASE_URL` | the Neon **direct** connection string from step 1 |
+   | `TELEGRAM_BOT_TOKEN` | the Render bot's token |
+   | `TELEGRAM_ALLOWED_USER_ID` | your numeric Telegram id |
+   | `GROQ_API_KEY` | your Groq key |
+
+5. Click **Deploy Blueprint**. Render needs a payment method for the Starter
+   plan.
+
+### Check that it works
+
+Open the worker → **Logs**. Within a minute you should see:
+
+```
+[supervisor] DATABASE_URL is set: using the external database
+[supervisor] llm is healthy
+[supervisor] api is healthy
+[supervisor] started bot
+... Bot polling...
+```
+
+Then message your Render bot `/start` and log something (`ran 3 miles`). In
+Neon's *Tables* view, `habits`, `daily_logs`, `audit_log`,
+`reminder_settings` and `schema_migrations` now exist.
+
+### Day to day
+
+| Task | How |
+|---|---|
+| **Deploy a new version** | Publish a new tag (e.g. `all-1.2.0`), change `image.url` in `render.yaml`, commit and push. Auto Sync redeploys. |
+| **Redeploy the same tag** | Worker → **Manual Deploy** → *Deploy latest reference* |
+| **Roll back** | Put the previous tag back in `render.yaml` and push |
+| **Change a secret** (e.g. a new Neon password) | Worker → **Environment** → edit → *Save changes* (Render restarts it) |
+| **Logs** | Worker → **Logs**; `[supervisor]` lines show starts, crashes and restarts |
+| **Backup** | Neon keeps 6 h of history on the free plan. For more, open the worker's **Shell** and run `habitflow-backup > /tmp/backup.sql`, or use `pg_dump` from your PC with the same URL |
+| **Stop it** | Worker → **Settings** → *Suspend* (no charges while suspended) |
+
+**Cost:** the Starter worker (Render bills per second; roughly $7 a month
+always on). Neon's free plan covers the database: the app closes its
+connections after a quiet minute, so Neon sleeps between uses.
+
+### If something's wrong
+
+| Symptom in the logs | Cause and fix |
+|---|---|
+| `Conflict: terminated by other getUpdates request` | The same bot token is running somewhere else. Stop the other copy or use a separate bot for Render |
+| `api exited with 3 while starting` repeating | The database can't be reached. Check `DATABASE_URL` (direct address, `sslmode=require`) and that the Neon project isn't suspended |
+| `password authentication failed` | The Neon password changed. Update `DATABASE_URL` under **Environment** |
+| Image pull failed | `jackdiva/habitflow:all-<tag>` doesn't exist or the repository is private: push it, or add registry credentials in Render |
+| Bot doesn't answer, no errors | `TELEGRAM_ALLOWED_USER_ID` isn't your id (other users are silently ignored) |
+| Every card says "AI is offline" | Bad `GROQ_API_KEY`, or Groq is rate limiting |
 
 ## Using the bot
 
@@ -139,7 +288,7 @@ ruff check .                                               # from repo root
 
 ### LLM evals
 
-`llm/evals/cases.yaml` holds 27 real phrases covering plain logs,
+`llm/evals/cases.yaml` holds 33 real phrases covering plain logs, units,
 relative dates, new habits, several habits in one message, and
 corrections, each with the expected intent. To score the real model
 (this makes one Groq request per case):

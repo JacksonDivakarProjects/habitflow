@@ -266,7 +266,7 @@ Edit correction made to it.
 1. **Branch:** `git switch -c my-change`.
 2. **Change the code.**
    - **Database schema:** add `api/migrations/NNNN_name.sql` (next number,
-     idempotent `IF NOT EXISTS`). Don't edit `db/init/` for existing installs.
+     idempotent `IF NOT EXISTS`). The API applies it at startup everywhere.
    - **LLM behaviour:** edit `llm/semantics.yaml`. The API tests fail if a
      SQL example there wouldn't pass the SQL guard.
 3. **Test everything.** This needs no Docker: the tests start a throwaway
@@ -280,11 +280,130 @@ Edit correction made to it.
    ```bash
    cd llm && GROQ_API_KEY=... python -m evals.run --min-pass 0.9
    ```
-   This makes 27 Groq requests. It shows each failing case and which fields
+   This makes 33 Groq requests. It shows each failing case and which fields
    were missed.
 5. **Push and open a PR.** CI runs lint plus the api, llm, bot and e2e
    suites. Merge only when it's green.
-6. **Deploy:** on the machine running the bot, `git pull && docker compose up -d --build`.
+6. **Deploy:** on the machine running the bot, `git pull && docker compose up -d --build`,
+   or publish images and pull them (next section).
+
+### Publishing to Docker Hub
+
+The compose file tags the images `jackdiva/habitflow:api-<tag>`,
+`:llm-<tag>` and `:bot-<tag>` (defaults: `HABITFLOW_IMAGE=jackdiva/habitflow`,
+`HABITFLOW_TAG=latest`).
+
+**On your build machine (from the repo):**
+
+```bash
+docker login                                   # as jackdiva
+export HABITFLOW_TAG=1.0.0                     # a version; also push "latest" if you like
+docker compose build
+docker compose push api llm bot                # db is the official postgres image
+```
+
+**On a server (no source code needed):**
+
+```bash
+mkdir habitflow && cd habitflow
+# copy docker-compose.yml here (scp, or download it from the GitHub repo)
+nano .env && chmod 600 .env                     # same variables as .env.example
+echo HABITFLOW_TAG=1.0.0 >> .env                # pin the release you pushed
+docker compose pull
+docker compose up -d
+```
+
+Only those two files are needed: the `build:` lines are ignored when the
+images can be pulled, and the database schema is created by the API on
+first start. (`docker compose publish` works too and never includes your
+secrets, but a compose file run straight from `oci://` can't read a local
+`.env`, so copying the file is the supported route.) Upgrading is `HABITFLOW_TAG=<new>` in `.env`, then `docker compose
+pull && docker compose up -d`. Your data stays in the `habitflow_pgdata`
+volume. The images are built for the architecture of the machine that built
+them (usually `amd64`); for an ARM server build with
+`docker buildx build --platform linux/arm64` or use a matching machine.
+
+### The single image (one container)
+
+`jackdiva/habitflow:all-<tag>` runs **everything in one container**: Postgres 16,
+the LLM service, the API and the bot, under a small supervisor
+(`allinone/run_all.py`) that starts them in order, restarts any that crash
+and shuts them down cleanly. The API and database listen inside the
+container only; nothing is published.
+
+**Run it** (`.env` needs only `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USER_ID`,
+`GROQ_API_KEY`, and optionally `APP_TIMEZONE` / `GROQ_MODEL_NAME`; **no
+`DATABASE_URL`**):
+
+```bash
+docker run -d --name habitflow --restart unless-stopped \
+  -v habitflow_data:/data --env-file .env jackdiva/habitflow:all-1.1.0
+docker logs -f habitflow          # "[supervisor] bot is healthy", then message the bot
+```
+
+or `docker compose -f docker-compose.single.yml up -d`.
+
+- **Keep the `/data` volume.** It *is* your database. Without `-v …:/data`
+  the data lives in an anonymous volume and is lost with the container.
+- **Backups:** `docker exec habitflow habitflow-backup > backup-$(date +%F).sql`.
+  Restore into a fresh container with
+  `docker exec -i habitflow psql -h /run/postgresql -U habitflow habitflow < backup.sql`.
+- **Upgrades:** `docker pull` the new tag, `docker rm -f habitflow`, and run
+  it again with the same volume. Migrations apply on start.
+- **Your own Postgres instead:** set `DATABASE_URL` (any of `postgres://`,
+  `postgresql://` or `postgresql+psycopg://`). The built-in database is then
+  not started.
+- **Debugging:** `docker exec habitflow ps -ef` shows the four processes; the
+  log lines tagged `[supervisor]` show starts, crashes and restarts.
+
+**Moving your existing compose data into it.** The single image can adopt
+the `habitflow_pgdata` volume from the four-container setup:
+
+```bash
+# in the old setup: back up first, then stop it (the volume is kept)
+docker compose exec db pg_dump -U <POSTGRES_USER> <POSTGRES_DB> > backup-before-move.sql
+docker compose down
+docker run -d --name habitflow --restart unless-stopped \
+  -v habitflow_pgdata:/data/pgdata \
+  -e POSTGRES_USER=<same as your .env> -e POSTGRES_DB=<same as your .env> \
+  --env-file .env.single jackdiva/habitflow:all-1.1.0
+```
+
+Here `.env.single` is your `.env` without `DATABASE_URL`. The volume is used
+in place: Postgres 16 data is required, and the supervisor rebuilds indexes
+if the text collation ever differs.
+
+**On Render:** `render.yaml` deploys the single image as one Background
+Worker (Starter) with a 1 GB disk at `/data`. That's the whole app on one
+paid instance, and Render snapshots the disk daily. Dashboard → New →
+Blueprint → this repo, then enter the three secrets.
+
+### Using Neon (managed Postgres) instead
+
+With the database on [Neon](https://neon.com), the app container stores
+nothing itself, so it runs anywhere (Render with no disk, a VM, your PC) and
+redeploys can't lose data. Neon's free plan has 0.5 GB storage, 100
+CU-hours of compute a month, and a 6-hour restore window.
+
+1. Create a Neon project (Postgres 16, 17 or 18 all work), in the region
+   closest to where the app runs (for Render Singapore: AWS `ap-southeast-1`).
+2. Copy the **direct** connection string (Connect → not the `-pooler` one):
+   `postgresql://neondb_owner:…@ep-….neon.tech/neondb?sslmode=require&channel_binding=require`
+3. Put it in `.env` as `DATABASE_URL=…` and start the single image **without
+   a `/data` volume**, or set it as the `DATABASE_URL` secret in `render.yaml`.
+   The API creates the schema on first start.
+
+**Staying inside the free compute.** Neon sleeps after 5 minutes with no open
+connection. For `*.neon.tech` hosts the API reuses connections while you're
+active and closes them all after a quiet minute, and the health checks don't
+touch the database, so Neon wakes only when you use the bot or a reminder runs. That's typically a few
+CU-hours a month, not the ~180 that an always-open connection would cost.
+`DATABASE_POOL=on|idle|off` overrides the automatic choice. The first message
+after a quiet spell takes a few hundred milliseconds longer while Neon wakes.
+
+**Backups:** Neon keeps 6 hours of history on the free plan; for anything
+older, run `docker exec habitflow habitflow-backup > backup-$(date +%F).sql`
+now and then (it dumps the Neon database when `DATABASE_URL` is set).
 
 ---
 

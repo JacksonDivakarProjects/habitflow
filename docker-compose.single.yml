@@ -1,0 +1,30 @@
+# HabitFlow as ONE container: Postgres + llm + api + bot (jackdiva/habitflow:all-<tag>).
+#
+#   docker compose -f docker-compose.single.yml up -d          # pull the image
+#   docker compose -f docker-compose.single.yml up -d --build  # or build it from source
+#
+# .env: TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID, GROQ_API_KEY (and optionally
+# APP_TIMEZONE, GROQ_MODEL_NAME, HABITFLOW_TAG). Leave DATABASE_URL OUT to use the
+# built-in database; set it only to use an external Postgres.
+#
+# Same equivalent without compose:
+#   docker run -d --name habitflow --restart unless-stopped \
+#     -v habitflow_data:/data --env-file .env jackdiva/habitflow:all-<tag>
+
+name: habitflow
+
+services:
+  habitflow:
+    image: ${HABITFLOW_IMAGE:-jackdiva/habitflow}:all-${HABITFLOW_TAG:-latest}
+    build:
+      context: .
+      dockerfile: allinone/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - data:/data            # the built-in database; keep this volume
+    stop_grace_period: 40s    # let Postgres shut down cleanly
+    # Nothing is published: the API and database listen inside the container only.
+
+volumes:
+  data:

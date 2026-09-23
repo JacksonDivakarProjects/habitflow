@@ -127,24 +127,71 @@ def test_offline_unknown_unit_word_used_as_typed(client, db, fake_llm, make_inte
 
 
 # ------------------------------------------------------------------
-# 5. "30m" was 30 meters of meditation
+# 5. "m" is meters for runs and minutes for meditation: the habit decides.
+#    (First fix dropped the alias, which broke "ran 500 m" on real data.)
 # ------------------------------------------------------------------
-def test_bare_m_is_not_meters():
-    parsed = parse_text("meditated 30m")
-    assert parsed.metric is None  # falls back to the habit default (minutes)
+@pytest.mark.parametrize(
+    "unit, habit_unit, expected",
+    [("m", "miles", "meters"), ("m", "km", "meters"), ("M", "minutes", "minutes"),
+     ("m", "hours", "minutes"), ("m", "pages", "m"), ("m", None, "m"), ("km", "minutes", "km")],
+)
+def test_resolve_reads_m_in_the_habits_family(unit, habit_unit, expected):
+    from app.units import resolve
+
+    assert resolve(unit, habit_unit) == expected
 
 
-def test_offline_meditation_30m_uses_minutes(client, fake_llm):
+def test_parser_keeps_bare_m_for_the_habit_to_decide():
+    assert parse_text("meditated 30m").metric == "m"
+    assert parse_text("I'm happy, read 12").metric is None  # "m" of I'm is not a unit
+
+
+@pytest.mark.parametrize(
+    "text, preview",
+    [("meditated 30m", "30 minutes of Meditation today"),
+     ("ran 500m", "500 meters of Running today"),
+     ("ran 800 meters", "800 meters of Running today")],
+)
+def test_offline_m_follows_the_habit(client, fake_llm, text, preview):
     fake_llm.queue(RuntimeError("groq down"))
 
-    r = client.post("/internal/draft", json={"chat_id": CHAT, "text": "meditated 30m"})
+    r = client.post("/internal/draft", json={"chat_id": CHAT, "text": text})
+
+    assert r.json()["preview"] == preview
+
+
+def test_llm_answer_in_m_follows_the_habit(client, fake_llm, make_intent):
+    body = _draft(client, fake_llm, make_intent(amount=500, metric="m"), "ran 500 m today")
+
+    assert body["preview"] == "500 meters of Running today"
+
+
+def test_unit_answer_m_follows_the_habit(client, fake_llm, make_intent):
+    intent = make_intent(habit_name="meditation", metric=None, amount=30)
+    audit_id = _draft(client, fake_llm, intent, "meditated 30")["audit_id"]
+
+    r = _clarify(client, audit_id, "m")
 
     assert r.json()["preview"] == "30 minutes of Meditation today"
-    assert r.json()["metric_source"] == "suggested"
 
 
-def test_meters_still_understood_spelled_out():
-    assert parse_text("ran 800 meters").metric == "meters"
+def test_stats_read_old_m_rows_in_context(client, db):
+    """Rows stored as "m" before this fix (like a real 'ran 500 m today')."""
+    from datetime import timedelta
+
+    from app.models import DailyLog
+    from app.timeutil import today
+
+    db.add_all([
+        DailyLog(habit_id=1, amount=500, metric="m", log_date=today(), source="llm"),
+        DailyLog(habit_id=1, amount=1, metric="miles", log_date=today() - timedelta(days=1),
+                 source="llm"),
+    ])
+    db.commit()
+
+    rows = client.get("/internal/stats", params={"chat_id": CHAT}).json()
+
+    assert [(r["habit"], r["metric"], r["total"]) for r in rows] == [("Running", "miles", 1.31)]
 
 
 def test_no_habit_rows_created_by_dropped_questions(client, db, fake_llm, make_intent):

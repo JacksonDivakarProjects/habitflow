@@ -11,7 +11,7 @@ from typing import Optional
 _ALIASES = {
     "miles": ["mile", "miles", "mi"],
     "km": ["km", "kms", "kilometer", "kilometers", "kilometre", "kilometres"],
-    # No bare "m": "30m" is minutes as often as meters. The LLM (or the user) decides.
+    # Bare "m" is ambiguous (meters or minutes): see AMBIGUOUS / resolve().
     "meters": ["meter", "meters", "metre", "metres"],
     "minutes": ["minute", "minutes", "min", "mins"],
     "hours": ["hour", "hours", "hr", "hrs", "h"],
@@ -61,6 +61,21 @@ def canonical(unit: Optional[str]) -> Optional[str]:
     if not s:
         return None
     return ALIASES.get(s, s)
+
+
+# Abbreviations whose meaning depends on the habit: "500 m" of running is
+# meters, "30 m" of meditation is minutes. Read in the habit's default family.
+AMBIGUOUS = {"m": {"distance": "meters", "time": "minutes"}}
+
+
+def resolve(unit: Optional[str], habit_unit: Optional[str]) -> Optional[str]:
+    """canonical(unit), with ambiguous abbreviations read in habit_unit's family.
+    Stays as typed when the habit gives no hint."""
+    c = canonical(unit)
+    if c in AMBIGUOUS:
+        family = _FAMILY_OF.get(canonical(habit_unit))
+        return AMBIGUOUS[c].get(family, c)
+    return c
 
 
 def is_known(word: str) -> bool:

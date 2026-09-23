@@ -16,7 +16,7 @@ from app.models import AuditLog, DailyLog, Habit, ReminderSetting
 from app.parser import find_habit, find_unit
 from app.progress import habit_stats, log_summary, reminder_check
 from app.timeutil import friendly_date, today
-from app.units import canonical, quantity
+from app.units import canonical, quantity, resolve
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
@@ -204,7 +204,8 @@ def clarify(req: ClarifyRequest, db: Session = Depends(get_db)):
             draft_sql=audit.draft_sql,
         )
 
-    intent["metric"] = canonical(metric)
+    habit = db.get(Habit, intent["habit_id"])
+    intent["metric"] = resolve(metric, habit.metric if habit else None)
     intent["metric_source"] = "explicit"
     new_sql = new_intent.get("draft_sql")
     if new_sql and drafting._dry_run_sql(db, new_sql) is None:  # same guard as drafts

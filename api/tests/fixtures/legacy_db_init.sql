@@ -1,3 +1,7 @@
+-- Frozen copy of the old db/init (01_schema.sql + 02_seed.sql), which created
+-- every database before the schema moved into api/migrations. Used to prove
+-- such databases upgrade cleanly. Do not edit.
+
 -- ============================================================
 -- HabitFlow — transactional schema (OLTP)
 -- Append-only fact tables. Facts captured at write time.
@@ -104,3 +108,11 @@ CREATE TRIGGER trg_habits_updated_at
 CREATE TRIGGER trg_audit_log_updated_at
     BEFORE UPDATE ON audit_log
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+INSERT INTO habits (name, display_name, metric, target_value, target_metric) VALUES
+    ('running',            'Running',            'miles',    NULL, NULL),
+    ('reading',            'Reading',            'pages',    NULL, NULL),
+    ('learning_sql',       'Learning SQL',       'hours',    NULL, NULL),
+    ('learning_concepts',  'Learning Concepts',  'concepts', NULL, NULL),
+    ('reels',              'Reels',              'hours',    NULL, NULL),
+    ('meditation',         'Meditation',         'minutes',  NULL, NULL);

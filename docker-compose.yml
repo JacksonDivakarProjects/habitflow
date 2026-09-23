@@ -1,21 +1,32 @@
+# HabitFlow: db + llm + api + bot.
+#
+# Local (from source):   docker compose up -d --build
+# Publish images:        docker login && docker compose build && docker compose push api llm bot
+# Server (no source):    copy this file + .env into a folder, then
+#                        docker compose pull && docker compose up -d
+#
+# Secrets are read from .env at runtime (env_file) and are never ${...}
+# substituted into this file, so sharing or publishing it never leaks them.
+
+name: habitflow  # fixed, so the volume is always habitflow_pgdata
+
 services:
   db:
     image: postgres:16.4
     restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+    env_file: .env  # POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./db/init:/docker-entrypoint-initdb.d:ro
+    # The schema is created by the api at startup (api/migrations), so an empty
+    # database needs no init scripts mounted.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 5s
       retries: 10
 
   llm:
+    image: ${HABITFLOW_IMAGE:-jackdiva/habitflow}:llm-${HABITFLOW_TAG:-latest}
     build: ./llm
     restart: unless-stopped
     env_file: .env
@@ -27,11 +38,11 @@ services:
       start_period: 10s
 
   api:
+    image: ${HABITFLOW_IMAGE:-jackdiva/habitflow}:api-${HABITFLOW_TAG:-latest}
     build: ./api
     restart: unless-stopped
-    env_file: .env
+    env_file: .env  # DATABASE_URL must use host "db"
     environment:
-      DATABASE_URL: ${DATABASE_URL}
       LLM_BASE_URL: http://llm:9000
     depends_on:
       db:
@@ -39,15 +50,16 @@ services:
       llm:
         condition: service_healthy
     ports:
-      - "127.0.0.1:8000:8000"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/db')"]
+      - "127.0.0.1:8000:8000"  # only reachable from this machine; /internal has no auth
+    healthcheck:  # /health, not /health/db: lets a serverless DATABASE_URL (Neon) sleep
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
 
   bot:
+    image: ${HABITFLOW_IMAGE:-jackdiva/habitflow}:bot-${HABITFLOW_TAG:-latest}
     build: ./bot
     restart: unless-stopped
     env_file: .env

@@ -5,6 +5,7 @@
 #   habit_name / proposed_habit   exact (proposed: after snake_case cleanup)
 #   amount                        number
 #   metric                        canonical unit, or null = "must not invent one"
+#   suggested_metric              the unit the model recommends when none was said
 #   log_date                      today | yesterday | -N (N days ago)
 #   extra_logs                    [{habit_name, amount, metric?}] in order
 # A correction case also has original_text + current_draft.
@@ -24,13 +25,21 @@ cases:
   - {name: jog synonym, text: "went for a 3 mile jog", expect: {habit_name: running, amount: 3, metric: miles}}
   - {name: decimal, text: "ran 2.5 miles", expect: {habit_name: running, amount: 2.5, metric: miles}}
   - {name: reading pages, text: "read 20 pages", expect: {habit_name: reading, amount: 20, metric: pages}}
-  - {name: no unit, text: "read 20", expect: {habit_name: reading, amount: 20, metric: null}}
+  - {name: no unit, text: "read 20", expect: {habit_name: reading, amount: 20, metric: null, suggested_metric: pages}}
   - {name: minutes abbrev, text: "meditated 15 mins", expect: {habit_name: meditation, amount: 15, metric: minutes}}
   - {name: words, text: "meditated for twenty minutes", expect: {habit_name: meditation, amount: 20, metric: minutes}}
   - {name: half hour, text: "meditated for half an hour", expect: {habit_name: meditation, amount: 30, metric: minutes}}
   - {name: sql hours, text: "studied sql for 2 hours", expect: {habit_name: learning_sql, amount: 2, metric: hours}}
   - {name: reels, text: "wasted 1.5 hours on instagram reels", expect: {habit_name: reels, amount: 1.5, metric: hours}}
   - {name: concepts, text: "learned 3 new concepts", expect: {habit_name: learning_concepts, amount: 3, metric: concepts}}
+
+  # --- units the model must normalize or disambiguate ------------------
+  - {name: m is meters for a run, text: "ran 500 m", expect: {habit_name: running, amount: 500, metric: meters}}
+  - {name: m is minutes for meditation, text: "meditated 30m", expect: {habit_name: meditation, amount: 30, metric: minutes}}
+  - {name: no conversion, text: "ran 5 km", expect: {habit_name: running, amount: 5, metric: km}}
+  - {name: hrs normalized, text: "sql for 3 hrs", expect: {habit_name: learning_sql, amount: 3, metric: hours}}
+  - {name: suggest from default, text: "meditated today", expect: {habit_name: meditation, metric: null, suggested_metric: minutes}}
+  - {name: new habit gets natural unit, text: "swam 10 today", expect: {proposed_habit: swimming, amount: 10, metric: null, suggested_metric: laps}}
 
   # --- dates ------------------------------------------------------------
   - {name: yesterday, text: "read 30 pages yesterday", expect: {habit_name: reading, amount: 30, log_date: yesterday}}
@@ -39,7 +48,7 @@ cases:
   - {name: day before yesterday, text: "day before yesterday I read 12 pages", expect: {habit_name: reading, amount: 12, log_date: -2}}
 
   # --- new habits -------------------------------------------------------
-  - {name: new habit, text: "did 20 pushups", expect: {proposed_habit: pushups, amount: 20}}
+  - {name: new habit, text: "did 20 pushups", expect: {proposed_habit: pushups, amount: 20, metric: null, suggested_metric: reps}}
   - {name: new habit unit, text: "learned rust for 2 hours", expect: {proposed_habit: learning_rust, amount: 2, metric: hours}}
   - {name: new habit water, text: "drank 8 glasses of water", expect: {proposed_habit: drinking_water, amount: 8, metric: glasses}}
 
