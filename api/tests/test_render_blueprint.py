@@ -33,3 +33,11 @@ def test_no_credentials_anywhere_in_the_file():
 def test_worker_region_is_explicit():
     spec = yaml.safe_load(BLUEPRINT.read_text(encoding="utf-8"))
     assert spec["services"][0]["region"] in {"oregon", "ohio", "virginia", "frankfurt", "singapore"}
+
+
+def test_readme_shows_the_real_blueprint():
+    """The annotated render.yaml in the README must match the file."""
+    readme = (BLUEPRINT.parent / "README.md").read_text(encoding="utf-8")
+    section = readme.split("### How `render.yaml` works", 1)[1]
+    shown = yaml.safe_load(section.split("```yaml\n", 1)[1].split("```", 1)[0])
+    assert shown == yaml.safe_load(BLUEPRINT.read_text(encoding="utf-8"))
