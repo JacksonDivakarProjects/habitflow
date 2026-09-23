@@ -27,7 +27,10 @@ RUN set -eux; \
       > /etc/apt/sources.list.d/pgdg.list; \
     echo "create_main_cluster = false" > /etc/postgresql-common/createcluster.conf; \
     apt-get update; \
-    apt-get install -y --no-install-recommends postgresql-${PG_MAJOR} procps; \
+    # + newer client tools, so habitflow-backup can dump an external server
+    #   (Neon runs 17/18); pg_dump must match the server's major version.
+    apt-get install -y --no-install-recommends postgresql-${PG_MAJOR} \
+      postgresql-client-17 postgresql-client-18 procps; \
     apt-get purge -y curl; apt-get autoremove -y; rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1 \

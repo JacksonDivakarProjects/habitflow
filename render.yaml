@@ -3,8 +3,8 @@
 # secrets marked `sync: false`.
 #
 # DATABASE_URL: your Neon connection string (Neon console -> Connect), e.g.
-#   postgresql://neondb_owner:<password>@ep-xxxx.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require
-# Keep the worker in the Neon database's region: us-east-2 (Ohio) -> region: ohio.
+#   postgresql://neondb_owner:<password>@ep-xxxx.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
+# Keep the worker in the Neon database's region: ap-southeast-1 -> singapore, us-east-2 -> ohio.
 # Use the direct connection string, not the "-pooler" one; the API opens one
 # connection per request for Neon, so it can scale to zero between uses.
 #
@@ -25,7 +25,7 @@ services:
     image:
       url: docker.io/jackdiva/habitflow:all-1.1.0
     plan: 0.5c-512mb          # Starter; the app uses ~150 MB without its database
-    region: ohio              # same place as the Neon database (aws us-east-2)
+    region: singapore         # same place as the Neon database (aws ap-southeast-1)
     envVars:
       - key: DATABASE_URL     # Neon connection string: entered in the Render dashboard,
         sync: false           # never written here (this file is public on GitHub)

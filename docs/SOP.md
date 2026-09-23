@@ -385,8 +385,8 @@ nothing itself, so it runs anywhere (Render with no disk, a VM, your PC) and
 redeploys can't lose data. Neon's free plan has 0.5 GB storage, 100
 CU-hours of compute a month, and a 6-hour restore window.
 
-1. Create a Neon project with **Postgres 16**, in the region closest to where
-   the app runs (for Render Singapore: AWS `ap-southeast-1`).
+1. Create a Neon project (Postgres 16, 17 or 18 all work), in the region
+   closest to where the app runs (for Render Singapore: AWS `ap-southeast-1`).
 2. Copy the **direct** connection string (Connect → not the `-pooler` one):
    `postgresql://neondb_owner:…@ep-….neon.tech/neondb?sslmode=require&channel_binding=require`
 3. Put it in `.env` as `DATABASE_URL=…` and start the single image **without
@@ -394,11 +394,11 @@ CU-hours of compute a month, and a 6-hour restore window.
    The API creates the schema on first start.
 
 **Staying inside the free compute.** Neon sleeps after 5 minutes with no open
-connection. For `*.neon.tech` hosts the API opens a connection per request and
-closes it (no pool), and the health checks don't touch the database, so Neon
-wakes only when you use the bot or a reminder runs. That's typically a few
+connection. For `*.neon.tech` hosts the API reuses connections while you're
+active and closes them all after a quiet minute, and the health checks don't
+touch the database, so Neon wakes only when you use the bot or a reminder runs. That's typically a few
 CU-hours a month, not the ~180 that an always-open connection would cost.
-`DATABASE_POOL=on|off` overrides the automatic choice. The first message
+`DATABASE_POOL=on|idle|off` overrides the automatic choice. The first message
 after a quiet spell takes a few hundred milliseconds longer while Neon wakes.
 
 **Backups:** Neon keeps 6 hours of history on the free plan; for anything

@@ -4,8 +4,21 @@
 # Restore into a fresh container:
 #   docker exec -i habitflow psql -h /run/postgresql -U habitflow habitflow < backup.sql
 set -eu
+
 if [ -n "${DATABASE_URL:-}" ]; then
-  # external database: pg_dump wants a plain libpq URL
-  exec pg_dump --no-owner "$(echo "$DATABASE_URL" | sed 's#^postgresql+psycopg://#postgresql://#; s#^postgres://#postgresql://#')"
+  # external database (e.g. Neon): pg_dump wants a plain libpq URL
+  TARGET=$(echo "$DATABASE_URL" | sed 's#^postgresql+psycopg://#postgresql://#; s#^postgres://#postgresql://#')
+  set -- "$TARGET"
+else
+  set -- -h /run/postgresql -U "${POSTGRES_USER:-habitflow}" "${POSTGRES_DB:-habitflow}"
 fi
-exec pg_dump --no-owner -h /run/postgresql -U "${POSTGRES_USER:-habitflow}" "${POSTGRES_DB:-habitflow}"
+
+# pg_dump refuses newer servers, and a newer pg_dump writes SQL an older server
+# may reject: use the one matching the server's major version.
+MAJOR=$(psql "$@" -tAc "SHOW server_version_num" | cut -c1-2)
+PG_DUMP=/usr/lib/postgresql/$MAJOR/bin/pg_dump
+if [ ! -x "$PG_DUMP" ]; then
+  echo "habitflow-backup: no pg_dump for Postgres $MAJOR in this image" >&2
+  exit 1
+fi
+exec "$PG_DUMP" --no-owner "$@"
