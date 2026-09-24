@@ -5,7 +5,8 @@ A personal habit tracker you talk to on Telegram. Send plain text like
 review the draft (including the SQL it wrote), and nothing is saved until
 you tap **Save**. Ask "how much did I read this month?" or "what's my
 reading pattern?" and it writes a read-only query, runs it on your data and
-answers, with the SQL one tap away.
+answers, with the SQL one tap away. Got an old log wrong? "change yesterday's
+run to 6 km" fixes it, after you confirm, and can be undone.
 
 ```
 Telegram ──> bot ──HTTP──> api ──HTTP──> llm ──> Groq (Llama 3.3 70B)
@@ -305,6 +306,8 @@ uses and stays within its free compute.
 | `/stats` | Totals and streaks for the last 30 days |
 | `/undo` | Void your most recent log (it stays in the audit trail) |
 | `ran 3 miles and read 20 pages` | One card with two lines; Save logs both |
+| `change yesterday's run to 6 km` | *Change this log? Running · 5 km → 6 km* → ✅ Apply → ↩️ Undo if needed |
+| `delete Monday's reading` | Confirm with 🗑 Delete; if several logs match you pick one |
 | `how much did I read this month?` | *60 pages of Reading this month, on 12 days.* + 🔍 SQL |
 | `what's my reading pattern` | A sentence plus a small table by weekday |
 | `/habits` | Tracked habits and their default units |
@@ -329,7 +332,7 @@ ruff check .                                               # from repo root
 
 | Suite | What it covers |
 |---|---|
-| `api/tests` | Every draft, clarify, approve, change, undo and discard path; message routing (`test_intents.py`, `test_messages.py`); questions end to end: the view, dates, templates, the LLM SQL path with retries, read-only execution and timeouts (`test_querying.py`); both SQL guards including attack cases (`test_select_guard.py`); units, the regex parser, migrations. |
+| `api/tests` | Every draft, clarify, approve, change, undo and discard path; message routing (`test_intents.py`, `test_messages.py`); changing and deleting saved logs (`test_log_edits.py`); questions end to end: the view, dates, templates, the LLM SQL path with retries, read-only execution and timeouts (`test_querying.py`); both SQL guards including attack cases (`test_select_guard.py`); units, the regex parser, migrations. |
 | `llm/tests` | Prompt construction, the `/extract`, `/classify`, `/query_sql` and `/answer` endpoints, and the eval scorers. |
 | `bot/tests` | Rendering (cards, tables, escaping) and every handler and button with a faked API: wording, popups, "cancel" words, questions asked mid-conversation. |
 | `e2e` | Whole conversations. The real bot handlers call the real API (in process) over a real database, with only Telegram and the LLM scripted. A small `Chat` simulator records every message, button and edit. |

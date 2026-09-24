@@ -2,6 +2,7 @@
 What does a message want?
 
   log    "ran 5 km", "read 20 pages yesterday", "30"
+  edit   "change yesterday's run to 6 km", "delete Monday's reading"
   query  "how much did I read this month?", "what's my reading pattern"
   chat   "hi", "thanks", "help"
 
@@ -14,10 +15,11 @@ import re
 from dataclasses import dataclass
 
 from app import llm_client
+from app.log_edits import looks_like_edit
 from app.querying import match_habits
 from app.units import ALIASES as UNIT_ALIASES
 
-KINDS = ("log", "query", "chat")
+KINDS = ("log", "query", "edit", "chat")
 
 _CHAT = re.compile(
     r"^(hi+|hello|hey+|yo|hola|thanks|thank you|thank u|thx|ty|ok|okay|k|cool|nice|great|"
@@ -41,7 +43,7 @@ _WORD = re.compile(r"[a-z]+")
 
 @dataclass
 class Classification:
-    kind: str  # log | query | chat
+    kind: str  # log | query | edit | chat
     source: str  # rules | llm | fallback
     reason: str
 
@@ -62,6 +64,8 @@ def classify_rules(text: str, habits: list[dict]) -> Classification | None:
         return Classification("chat", "rules", "empty message")
     if _CHAT.match(lowered):
         return Classification("chat", "rules", "greeting or help")
+    if looks_like_edit(lowered):
+        return Classification("edit", "rules", "changes or deletes a saved log")
     if lowered.endswith("?"):
         return Classification("query", "rules", "ends with a question mark")
     if _QUESTION_START.match(lowered):

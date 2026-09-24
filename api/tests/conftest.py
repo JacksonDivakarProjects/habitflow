@@ -76,7 +76,7 @@ def clean_db(migrated):
     seed = SEED_SQL.read_text()
     with engine.begin() as conn:
         conn.exec_driver_sql(
-            "TRUNCATE daily_logs, audit_log, query_log, habits RESTART IDENTITY CASCADE"
+            "TRUNCATE log_edits, daily_logs, audit_log, query_log, habits RESTART IDENTITY CASCADE"
         )
         conn.exec_driver_sql(seed)
     yield

@@ -67,7 +67,7 @@ Then send `/start` to your bot in Telegram. If it doesn't answer, see
 ## 2. Daily use
 
 Send the bot a plain message. It works out whether you are **logging**
-something, **asking** about your routine, or just saying hi, and answers
+something, **fixing** a saved log, **asking** about your routine, or just saying hi, and answers
 accordingly. You never need a command to log or ask.
 
 ### Logging
@@ -116,6 +116,33 @@ Keep as is, or reply `cancel`.
 
 Asking a question while a change or a unit question is open is fine: the
 bot answers it and reminds you what it's still waiting for.
+
+### Fixing a saved log
+
+Say what's wrong in plain words. No command is needed:
+
+| You send | You get |
+|---|---|
+| `change yesterday's run to 6 km` | ✏️ Change this log? • Running · 5 km → **6 km** · yesterday |
+| `yesterday's reading was 30 pages` | The same, said differently |
+| `change yesterday's run to km` | Keeps the number, fixes the unit |
+| `move today's meditation to yesterday` | Moves it to another day |
+| `delete Monday's reading`, `remove my last run` | 🗑 Delete this log? |
+| `delete the 5 km run on 21 sep` | The amount and date narrow it down |
+
+Days can be `today`, `yesterday`, `3 days ago`, a weekday (`Monday` means the most
+recent one), `last Monday`, `21 sep`, `sep 21`, `21/9` or `2026-09-21`.
+
+Nothing changes until you tap **✅ Apply** (or **🗑 Delete**). If several logs
+match, the bot lists them and you tap the right one. Afterwards **↩️ Undo**
+puts the log back exactly as it was. A deleted log is voided like `/undo`
+does, so it stays in the audit trail. Every change is recorded in the
+`log_edits` table with the old and new values.
+
+The bot refuses changes that make no sense: an amount of 0 (say "delete"
+instead), a date in the future, or a change to what the log already says. An
+undo is refused if the log was changed again afterwards; undo the newer change
+first.
 
 ### Commands
 
@@ -415,6 +442,7 @@ now and then (it dumps the Neon database when `DATABASE_URL` is set).
 | API crashes mentioning `psycopg2` | `DATABASE_URL` is missing `+psycopg` | Fix `.env`, then `docker compose up -d` |
 | Every card says ⚡ AI is offline | Bad Groq key, wrong model name, or rate limit | `docker compose logs llm` |
 | A question gets "I can't work that one out right now" | The LLM is offline; only simple totals work without it | `docker compose logs llm`; ask "how much did I … this month" meanwhile |
+| “I couldn't find a … to change” | No live log matches that habit and day (undone logs don't count) | `/today`, or name the day: “delete Monday's reading” |
 | An answer looks wrong | Tap 🔍 SQL to see the query; check the habit and dates it used | `query_log` has every question and its SQL (section 3) |
 | "Sorry, I couldn't turn that into a log" | The model failed 3 times | Rephrase ("ran 3 miles"); the reason is in `audit_log.error_message` |
 | Logs land on the wrong day | `APP_TIMEZONE` isn't your zone | Set it in `.env`, then `docker compose up -d` |

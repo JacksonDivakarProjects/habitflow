@@ -488,3 +488,72 @@ def test_help_and_start(chat):
     help_text = chat.say("/help")[0]
     assert "/today" in help_text and "/remind" not in help_text
     assert chat.say("/start")[0].startswith("👋 HabitFlow is ready.")
+
+
+# ------------------------------------------------------------------
+# Fixing saved logs
+# ------------------------------------------------------------------
+def test_change_a_saved_log_then_undo(chat, db, fake_llm, make_intent):
+    fake_llm.queue(make_intent(amount=5, metric="km", log_date=YESTERDAY))
+    chat.say("ran 5 km yesterday")
+    chat.tap("✅ Save")
+
+    [card] = chat.say("change yesterday's run to 6 km")
+    assert card == "✏️ Change this log?\n• Running · 5 km → 6 km · yesterday"
+    assert len(fake_llm.calls) == 1                          # no LLM needed to fix it
+    assert float(_logs(db)[0].amount) == 5                   # nothing changes before Apply
+
+    chat.tap("✅ Apply")
+    assert chat.last.text == "✅ Changed\n• Running · 6 km · yesterday\nwas 5 km · yesterday"
+    assert float(_logs(db)[0].amount) == 6
+    assert chat.say("how many km did I run yesterday") == [
+        "💬 6 km of Running yesterday."]
+
+    undone = chat.tap("↩️ Undo")                            # on the "Changed" message
+    assert undone.text == "↩️ Put back: 5 km of Running yesterday"
+    assert float(_logs(db)[0].amount) == 5
+
+
+def test_delete_one_of_two_logs(chat, db, fake_llm, make_intent):
+    for amount in (3, 2):
+        fake_llm.queue(make_intent(amount=amount))
+        chat.say(f"ran {amount} miles")
+        chat.tap("✅ Save")
+
+    [question] = chat.say("delete today's run")
+    assert question == "🔎 Which one should I delete?"
+    assert chat.last.buttons == ["Running · 2 miles · today", "Running · 3 miles · today",
+                                 "✖ Cancel"]
+    chat.tap("Running · 3 miles · today")
+    assert chat.last.text == "🗑 Delete this log?\n• Running · 3 miles · today"
+    chat.tap("🗑 Delete")
+    assert chat.last.text == "🗑 Deleted: 3 miles of Running today"
+    assert [float(x.amount) for x in _logs(db)] == [2.0]
+
+
+def test_move_a_log_to_another_day(chat, db, fake_llm, make_intent):
+    fake_llm.queue(make_intent(habit_name="meditation", amount=15, metric="minutes"))
+    chat.say("meditated 15 minutes")
+    chat.tap("✅ Save")
+
+    [card] = chat.say("move today's meditation to yesterday")
+    assert card == "✏️ Change this log?\n• Meditation · 15 minutes · today → yesterday"
+    chat.tap("✅ Apply")
+    assert _logs(db)[0].log_date.isoformat() == YESTERDAY
+    assert chat.say("/today")[0].startswith("Nothing logged yet today.")
+
+
+def test_keep_it_and_unclear_requests(chat, db, fake_llm, make_intent):
+    fake_llm.queue(make_intent())
+    chat.say("ran 4 miles")
+    chat.tap("✅ Save")
+
+    chat.say("delete today's run")
+    chat.tap("✖ Keep it")
+    assert chat.last.text == "✖ OK, I left it as it was."
+    assert len(_logs(db)) == 1
+
+    [reply] = chat.say("delete yesterday's reading")
+    assert reply.startswith("🤔 I couldn't find a reading yesterday")
+    [reply] = chat.say("change today's run")
+    assert reply.startswith("🤔 What should it be?")

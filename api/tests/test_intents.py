@@ -69,6 +69,18 @@ def test_small_talk(text):
     assert decided and decided.kind == "chat", decided
 
 
+@pytest.mark.parametrize("text", [
+    "change yesterday's run to 6 km",
+    "delete Monday's reading",
+    "remove my last run",
+    "please fix today's meditation",
+    "yesterday's run was 6 km",
+])
+def test_edits(text):
+    decided = classify_rules(text, HABITS)
+    assert decided and decided.kind == "edit", decided
+
+
 @pytest.mark.parametrize("text", ["read today", "sql last week", "running", "meditated"])
 def test_unclear_messages_are_left_to_the_llm(text):
     assert classify_rules(text, HABITS) is None

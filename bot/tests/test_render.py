@@ -221,3 +221,63 @@ def test_legacy_buttons_map_to_new_actions():
     assert bot._parse_callback("unit:7:km") == ("unit", 7, "km")
     with pytest.raises(ValueError):
         bot._parse_callback("nonsense")
+
+
+# ------------------------------------------------------------------
+# Changing saved logs
+# ------------------------------------------------------------------
+BEFORE = {"log_id": 3, "habit": "Running", "amount": 5.0, "unit": "km", "quantity": "5 km",
+          "log_date": "2026-09-23", "when": "yesterday"}
+AFTER = {**BEFORE, "amount": 6.0, "quantity": "6 km"}
+
+
+def test_edit_confirm_card_shows_what_changes():
+    text, markup = bot.render_edit({"edit_id": 4, "status": "pending", "action": "edit",
+                                    "before": BEFORE, "after": AFTER})
+    assert text == "✏️ <b>Change this log?</b>\n• <b>Running</b> · 5 km → <b>6 km</b> · yesterday"
+    assert buttons(markup) == [("✅ Apply", "eapply:4"), ("✖ Cancel", "ecancel:4")]
+
+
+def test_edit_moving_a_day():
+    moved = {**BEFORE, "when": "today"}
+    text, _ = bot.render_edit({"edit_id": 4, "status": "pending", "action": "edit",
+                               "before": BEFORE, "after": moved})
+    assert "5 km · yesterday → <b>today</b>" in text
+
+
+def test_delete_confirm_card():
+    text, markup = bot.render_edit({"edit_id": 4, "status": "pending", "action": "delete",
+                                    "before": BEFORE})
+    assert text == "🗑 <b>Delete this log?</b>\n• <b>Running</b> · 5 km · yesterday"
+    assert buttons(markup) == [("🗑 Delete", "eapply:4"), ("✖ Keep it", "ecancel:4")]
+
+
+def test_choose_between_logs():
+    other = {**BEFORE, "log_id": 9, "quantity": "2 miles", "when": "on Mon 21 Sep"}
+    text, markup = bot.render_edit({"edit_id": 4, "status": "choosing", "action": "delete",
+                                    "candidates": [BEFORE, other]})
+    assert text == "🔎 <b>Which one should I delete?</b>"
+    assert buttons(markup) == [("Running · 5 km · yesterday", "epick:4:3"),
+                               ("Running · 2 miles · Mon 21 Sep", "epick:4:9"),
+                               ("✖ Cancel", "ecancel:4")]
+
+
+def test_edit_done_undone_cancelled_unclear():
+    text, markup = bot.render_edit({"edit_id": 4, "status": "applied", "action": "edit",
+                                    "before": BEFORE, "after": AFTER})
+    assert text == ("✅ <b>Changed</b>\n• <b>Running</b> · 6 km · yesterday\n"
+                    "<i>was 5 km · yesterday</i>")
+    assert buttons(markup) == [("↩️ Undo", "erevert:4")]
+    text, _ = bot.render_edit({"edit_id": 4, "status": "applied", "action": "delete",
+                               "before": BEFORE})
+    assert text == "🗑 <b>Deleted</b>: 5 km of Running yesterday"
+    text, markup = bot.render_edit({"edit_id": 4, "status": "reverted", "action": "delete",
+                                    "before": BEFORE})
+    assert text.startswith("↩️ <b>Put back</b>") and markup is None
+    assert bot.render_edit({"status": "cancelled"})[0] == "✖ OK, I left it as it was."
+    text, markup = bot.render_edit({"status": "unclear", "message": "Which log? <x>"})
+    assert text == "🤔 Which log? &lt;x&gt;" and markup is None
+
+
+def test_help_mentions_fixing_logs():
+    assert "change yesterday's run to 6 km" in bot.HELP_TEXT

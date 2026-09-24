@@ -26,6 +26,7 @@ def _system(call) -> str:
 def test_classify_prompt_has_kinds_habits_and_examples():
     prompt = questions.classify_prompt(HABITS)
     assert "- log:" in prompt and "- query:" in prompt and "- chat:" in prompt
+    assert "- edit:" in prompt
     assert "- running (display: Running, unit: miles)" in prompt
     assert '"read today" -> query' in prompt
 

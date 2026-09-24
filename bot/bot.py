@@ -3,6 +3,7 @@ HabitFlow Telegram bot: a thin client over the API.
 
 Every message goes to POST /internal/message, which decides what it is:
   log     -> a draft card:      ✅ Save  ✏️ Change  ✖ Cancel  🔍 SQL
+  edit    -> a change to a saved log, confirmed first (✅ Apply / 🗑 Delete), with ↩️ Undo
   answer  -> the answer, a small table when there are rows, and 🔍 SQL
   chat    -> help
 Two short conversations are tracked in user_data: a unit question (answer
@@ -361,6 +362,66 @@ def render_answer(data: dict) -> tuple[str, InlineKeyboardMarkup | None]:
     return text, markup
 
 
+def _when(item: dict) -> str:
+    return item["when"].removeprefix("on ")
+
+
+def _changed(before: dict, after: dict, key: str) -> str:
+    """'5 km → <b>6 km</b>', or just '5 km' when that part didn't change."""
+    old, new = before[key], after[key]
+    return h(old) if old == new else f"{h(old)} → <b>{h(new)}</b>"
+
+
+def render_edit(data: dict) -> tuple[str, InlineKeyboardMarkup | None]:
+    """A change to a saved log, at any stage: choose, confirm, done, undone."""
+    edit_id, status = data.get("edit_id"), data.get("status")
+    before, after = data.get("before"), data.get("after")
+    delete = data.get("action") == "delete"
+    if status == "choosing":
+        rows = [
+            [(f"{c['habit']} · {c['quantity']} · {_when(c)}", f"epick:{edit_id}:{c['log_id']}")]
+            for c in data.get("candidates") or []
+        ]
+        verb = "delete" if delete else "change"
+        return f"🔎 <b>Which one should I {verb}?</b>", _keyboard(
+            *rows, [("✖ Cancel", f"ecancel:{edit_id}")]
+        )
+    if status == "pending" and delete:
+        return (
+            f"🗑 <b>Delete this log?</b>\n• <b>{h(before['habit'])}</b> · "
+            f"{h(before['quantity'])} · {h(before['when'])}",
+            _keyboard([("🗑 Delete", f"eapply:{edit_id}"), ("✖ Keep it", f"ecancel:{edit_id}")]),
+        )
+    if status == "pending":
+        return (
+            f"✏️ <b>Change this log?</b>\n• <b>{h(before['habit'])}</b> · "
+            f"{_changed(before, after, 'quantity')} · {_changed(before, after, 'when')}",
+            _keyboard([("✅ Apply", f"eapply:{edit_id}"), ("✖ Cancel", f"ecancel:{edit_id}")]),
+        )
+    if status == "applied":
+        undo = _keyboard([("↩️ Undo", f"erevert:{edit_id}")])
+        if delete:
+            return (
+                f"🗑 <b>Deleted</b>: {h(before['quantity'])} of {h(before['habit'])} "
+                f"{h(before['when'])}",
+                undo,
+            )
+        return (
+            f"✅ <b>Changed</b>\n• <b>{h(after['habit'])}</b> · {h(after['quantity'])} · "
+            f"{h(after['when'])}\n<i>was {h(before['quantity'])} · {h(before['when'])}</i>",
+            undo,
+        )
+    if status == "reverted":
+        return (
+            f"↩️ <b>Put back</b>: {h(before['quantity'])} of {h(before['habit'])} "
+            f"{h(before['when'])}",
+            None,
+        )
+    if status == "cancelled":
+        return "✖ OK, I left it as it was.", None
+    return f"🤔 {h(data.get('message') or 'I could not work out which log to change.')}", None
+
+
 def render_sql(title: str, sql: str) -> str:
     return f"🔍 <b>{h(title)}</b>\n<pre>{h(sql.strip())}</pre>"
 
@@ -378,6 +439,11 @@ HELP_TEXT = (
     "  “how many hours did I work last week?”\n"
     "  “which days did I skip meditation?”\n"
     "Tap 🔍 SQL to see exactly how it was counted.\n\n"
+    "<b>Fix</b> a saved log:\n"
+    "  “change yesterday's run to 6 km”\n"
+    "  “move today's reading to yesterday”\n"
+    "  “delete Monday's meditation”\n"
+    "You confirm first, and can undo it.\n\n"
     "<b>Commands</b>\n" + "\n".join(f"  /{name} — {h(desc)}" for name, desc in COMMANDS)
 )
 
@@ -664,6 +730,9 @@ async def _send_message(
         await _show_draft(update.message, context, data["draft"])
     elif kind == "answer":
         text, markup = render_answer(data["answer"])
+        await _reply(update.message, text, markup)
+    elif kind == "edit":
+        text, markup = render_edit(data["edit"])
         await _reply(update.message, text, markup)
     elif kind == "chat":
         await _reply(update.message, HELP_TEXT)
@@ -972,6 +1041,45 @@ async def on_query_sql(update, context, query, query_id, extra):
         pass
 
 
+async def _edit_step(query, edit_id: int, step: str, payload: dict | None = None):
+    """One step of a change to a saved log. The API's refusals are already
+    written for people ("A newer change replaced this one."), so show them."""
+    try:
+        r = await _post(f"/internal/edits/{edit_id}/{step}", payload or {})
+    except Exception:
+        log.exception("edit %s failed", step)
+        await query.answer(UNREACHABLE, show_alert=True)
+        return
+    if r.status_code >= 400:
+        detail = _detail(r)
+        await query.answer(detail if isinstance(detail, str) else _friendly_error(r),
+                           show_alert=True)
+        return
+    await query.answer()
+    text, markup = render_edit(r.json())
+    await _edit(query, text, markup)
+
+
+async def on_edit_apply(update, context, query, edit_id, extra):
+    await _edit_step(query, edit_id, "apply")
+
+
+async def on_edit_cancel(update, context, query, edit_id, extra):
+    await _edit_step(query, edit_id, "cancel")
+
+
+async def on_edit_pick(update, context, query, edit_id, extra):
+    if not (extra or "").isdigit():
+        await query.answer()
+        await query.edit_message_text("That button is no longer valid.")
+        return
+    await _edit_step(query, edit_id, "choose", {"log_id": int(extra)})
+
+
+async def on_edit_revert(update, context, query, edit_id, extra):
+    await _edit_step(query, edit_id, "undo")
+
+
 BUTTONS = {
     "save": on_save,
     "cancel": on_cancel,
@@ -985,6 +1093,10 @@ BUTTONS = {
     "undo_audit": on_undo_audit,
     "sql": on_draft_sql,
     "qsql": on_query_sql,
+    "eapply": on_edit_apply,
+    "ecancel": on_edit_cancel,
+    "epick": on_edit_pick,
+    "erevert": on_edit_revert,
 }
 
 

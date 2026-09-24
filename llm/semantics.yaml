@@ -157,6 +157,7 @@ classifier:
   kinds:
     log: "the user reports something they did, to be recorded (usually has an amount)"
     query: "the user asks about their own past activity: totals, patterns, streaks, comparisons"
+    edit: "the user wants to change or delete something already logged (a wrong amount, unit or day)"
     chat: "greetings, thanks, help, or anything unrelated to logging or their data"
   examples:
     - {text: "read today", kind: query}
@@ -165,6 +166,8 @@ classifier:
     - {text: "meditated before bed", kind: log}
     - {text: "reading lately", kind: query}
     - {text: "pushups twenty", kind: log}
+    - {text: "yesterday's run should've been 6 km", kind: edit}
+    - {text: "that reading on monday was wrong, remove it", kind: edit}
     - {text: "tell me a joke", kind: chat}
     - {text: "is it going well", kind: query}
 

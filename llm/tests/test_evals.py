@@ -149,7 +149,7 @@ from evals import questions as qevals  # noqa: E402
 
 def test_question_case_file_is_well_formed():
     data = qevals.load_cases()
-    assert {c["kind"] for c in data["classify"]} == {"log", "query", "chat"}
+    assert {c["kind"] for c in data["classify"]} == {"log", "query", "edit", "chat"}
     names = [c["name"] for c in data["query"]]
     assert len(names) == len(set(names))
     anchors = qevals.anchors(REF)

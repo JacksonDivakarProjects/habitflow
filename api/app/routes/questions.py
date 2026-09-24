@@ -14,6 +14,7 @@ from app.db import get_db
 from app.intents import classify
 from app.models import QueryLog
 from app.routes.drafts import DraftFailed, DraftRequest, DraftResponse, create_draft
+from app.routes.edits import EditRequest, EditResponse, start_edit
 
 router = APIRouter(prefix="/internal", tags=["questions"])
 
@@ -21,7 +22,8 @@ HELP_TEXT = (
     "Tell me what you did and I'll log it: “ran 5 km”, “read 20 pages yesterday”, "
     "“meditated 15 min and 30 pushups”.\n"
     "Or ask about your routine: “how much did I read this month?”, "
-    "“what's my running pattern?”, “how many hours did I work last week?”."
+    "“what's my running pattern?”, “how many hours did I work last week?”.\n"
+    "Or fix a saved log: “change yesterday's run to 6 km”, “delete Monday's reading”."
 )
 LOG_FAILED = (
     "I couldn't turn that into a log. Try “ran 5 km” or “read 20 pages yesterday”, "
@@ -84,10 +86,11 @@ class MessageRequest(BaseModel):
 
 
 class MessageResponse(BaseModel):
-    kind: str  # log | answer | chat | error
+    kind: str  # log | answer | edit | chat | error
     classified_by: str
     draft: DraftResponse | None = None
     answer: AskResponse | None = None
+    edit: EditResponse | None = None
     text: str | None = None
 
 
@@ -96,6 +99,11 @@ def message(req: MessageRequest, db: Session = Depends(get_db)):
     decision = classify(req.text, drafting.habits_context(db))
     if decision.kind == "chat":
         return MessageResponse(kind="chat", classified_by=decision.source, text=HELP_TEXT)
+    if decision.kind == "edit":
+        return MessageResponse(
+            kind="edit", classified_by=decision.source,
+            edit=start_edit(EditRequest(chat_id=req.chat_id, text=req.text), db),
+        )
     if decision.kind == "query":
         return MessageResponse(
             kind="answer", classified_by=decision.source,
