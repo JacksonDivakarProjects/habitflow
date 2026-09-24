@@ -67,15 +67,29 @@ def api(monkeypatch):
     return fake
 
 
-def make_update(text=None, user_id=ALLOWED_USER, message_id=10, callback_data=None):
-    message = SimpleNamespace(text=text, message_id=message_id, reply_text=AsyncMock())
+_next_message_id = iter(range(500, 10_000))
+
+
+def _sent_message(*args, **kwargs):
+    return SimpleNamespace(message_id=next(_next_message_id))
+
+
+def make_update(text=None, user_id=ALLOWED_USER, message_id=10, callback_data=None,
+                message_text="📝 Log this?\n• Running · 4 miles · today"):
+    message = SimpleNamespace(
+        text=text, message_id=message_id, reply_text=AsyncMock(side_effect=_sent_message)
+    )
     query = None
     if callback_data is not None:
         query = SimpleNamespace(
             data=callback_data,
             answer=AsyncMock(),
             edit_message_text=AsyncMock(),
-            message=SimpleNamespace(message_id=message_id, text="📝 4 miles of Running today"),
+            edit_message_reply_markup=AsyncMock(),
+            message=SimpleNamespace(
+                message_id=message_id, text=message_text,
+                reply_text=AsyncMock(side_effect=_sent_message),
+            ),
         )
     return SimpleNamespace(
         effective_user=SimpleNamespace(id=user_id),
@@ -85,44 +99,13 @@ def make_update(text=None, user_id=ALLOWED_USER, message_id=10, callback_data=No
     )
 
 
-class FakeJob:
-    def __init__(self, name, **kwargs):
-        self.name, self.kwargs, self.removed = name, kwargs, False
-
-    def schedule_removal(self):
-        self.removed = True
-
-
-class FakeJobQueue:
-    """The slice of telegram.ext.JobQueue the bot uses."""
-
-    def __init__(self):
-        self.jobs: list[FakeJob] = []
-
-    def run_daily(self, callback, time, chat_id, name):
-        job = FakeJob(name, callback=callback, time=time, chat_id=chat_id)
-        self.jobs.append(job)
-        return job
-
-    def run_once(self, callback, when, name=None):
-        job = FakeJob(name, callback=callback, when=when)
-        self.jobs.append(job)
-        return job
-
-    def get_jobs_by_name(self, name):
-        return [j for j in self.jobs if j.name == name and not j.removed]
-
-    def active(self):
-        return [j for j in self.jobs if not j.removed]
-
-
-def make_context(args=None, job_queue=None, **user_data):
+def make_context(**user_data):
     return SimpleNamespace(
         user_data=dict(user_data),
-        args=list(args or []),
-        job_queue=job_queue if job_queue is not None else FakeJobQueue(),
+        args=[],
         bot=SimpleNamespace(
             edit_message_text=AsyncMock(),
+            edit_message_reply_markup=AsyncMock(),
             send_chat_action=AsyncMock(),
             send_message=AsyncMock(),
         ),
@@ -130,7 +113,21 @@ def make_context(args=None, job_queue=None, **user_data):
 
 
 def replies(update) -> list[str]:
+    """Texts sent as replies to the user's message."""
     return [c.args[0] for c in update.message.reply_text.await_args_list]
+
+
+def query_replies(update) -> list[str]:
+    """Texts sent as replies from a button's message."""
+    return [c.args[0] for c in update.callback_query.message.reply_text.await_args_list]
+
+
+def markup_of(mock) -> object:
+    return mock.await_args.kwargs.get("reply_markup")
+
+
+def buttons(markup) -> list[tuple[str, str]]:
+    return [(b.text, b.callback_data) for row in (markup.inline_keyboard if markup else []) for b in row]
 
 
 def edited(update) -> str:

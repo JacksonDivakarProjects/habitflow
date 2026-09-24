@@ -145,3 +145,125 @@ units:
     - {text: "read 20", habit_default: pages, metric: null, suggested_metric: pages}
     - {text: "did 20 pushups", habit_default: "(new habit)", metric: null, suggested_metric: reps}
     - {text: "drank 8 glasses of water", habit_default: "(new habit)", metric: glasses, suggested_metric: null}
+
+# ============================================================
+# Questions about the logs ("how much did I read this month?")
+# ============================================================
+
+# ------------------------------------------------------------
+# Classifier: only messages the API's rules couldn't place get here.
+# ------------------------------------------------------------
+classifier:
+  kinds:
+    log: "the user reports something they did, to be recorded (usually has an amount)"
+    query: "the user asks about their own past activity: totals, patterns, streaks, comparisons"
+    chat: "greetings, thanks, help, or anything unrelated to logging or their data"
+  examples:
+    - {text: "read today", kind: query}
+    - {text: "running this morning, four miles", kind: log}
+    - {text: "sql last week", kind: query}
+    - {text: "meditated before bed", kind: log}
+    - {text: "reading lately", kind: query}
+    - {text: "pushups twenty", kind: log}
+    - {text: "tell me a joke", kind: chat}
+    - {text: "is it going well", kind: query}
+
+# ------------------------------------------------------------
+# Text-to-SQL: one read-only SELECT over these relations only.
+# The API rejects anything else and sends the reason back.
+# ------------------------------------------------------------
+query:
+  relations:
+    - name: habit_logs
+      description: "One row per logged activity. Undone logs are already excluded."
+      columns:
+        - {name: log_id, type: BIGINT}
+        - {name: habit, type: TEXT, description: "habit's internal name, e.g. 'reading' (match against KNOWN HABITS names)"}
+        - {name: habit_display, type: TEXT, description: "e.g. 'Reading'"}
+        - {name: amount, type: NUMERIC, description: "the number as logged, in `unit`"}
+        - {name: unit, type: TEXT, description: "unit as logged, e.g. 'km', 'minutes', 'pages'"}
+        - {name: habit_unit, type: TEXT, description: "the habit's default unit, NULL if it has none"}
+        - {name: amount_in_habit_unit, type: NUMERIC, description: "amount converted to habit_unit (5 km -> 3.1069 for a miles habit); NULL when the units can't convert (e.g. minutes of reading for a pages habit)"}
+        - {name: log_date, type: DATE, description: "the day it was done"}
+        - {name: logged_at, type: TIMESTAMPTZ, description: "when it was recorded"}
+        - {name: weekday, type: INTEGER, description: "1 = Monday .. 7 = Sunday"}
+        - {name: weekday_name, type: TEXT, description: "'Monday' .. 'Sunday'"}
+        - {name: week_start, type: DATE, description: "Monday of that week"}
+        - {name: month_start, type: DATE, description: "first day of that month"}
+    - name: habits
+      description: "Habit definitions (to list habits, or find ones with no logs)."
+      columns:
+        - {name: name, type: TEXT}
+        - {name: display_name, type: TEXT}
+        - {name: metric, type: TEXT, description: "default unit"}
+        - {name: is_active, type: BOOLEAN}
+  rules:
+    - "return exactly ONE PostgreSQL SELECT (CTEs, window functions, UNION allowed); never write INSERT/UPDATE/DELETE/DDL"
+    - "read only habit_logs and habits; no other tables, schemas or system catalogs"
+    - "never use CURRENT_DATE, NOW(), CURRENT_TIMESTAMP: use the literal dates from DATES, e.g. log_date >= DATE '2026-09-01'"
+    - "if QUESTION_PERIOD is given, filter log_date to exactly that range; with no period, use all time"
+    - "filter habits by the exact `habit` name from KNOWN HABITS (\"worked\" -> 'work', \"ran\" -> 'running'); if no habit is named, cover all habits and group by habit"
+    - "sum amounts with coalesce(amount_in_habit_unit, amount) and group by CASE WHEN amount_in_habit_unit IS NULL THEN unit ELSE habit_unit END, so different units are never added together"
+    - "when the user asks in another unit (\"how many hours\" for a minutes habit) convert in SQL: minutes/60 = hours, km*0.621371 = miles"
+    - "'pattern', 'trend', 'habit over time' questions: group by weekday (ORDER BY weekday) or by week_start/month_start, with totals and counts of days"
+    - "streaks and gaps: use DISTINCT log_date with window functions (log_date - row_number() days trick)"
+    - "days with no logs: generate_series(DATE 'start', DATE 'end', INTERVAL '1 day') LEFT JOIN habit_logs"
+    - "give every computed column a short snake_case alias (total_pages, days_logged); round decimals to 2 places"
+    - "keep results small and readable: aggregate instead of listing raw rows when you can; ORDER BY something meaningful"
+    - "if the question can't be answered from these relations (weather, advice, other people), return sql: null and a short friendly note saying what you CAN answer"
+  examples:
+    - question: "how much did I read this month"
+      sql: |
+        SELECT CASE WHEN amount_in_habit_unit IS NULL THEN unit ELSE habit_unit END AS unit,
+               round(sum(coalesce(amount_in_habit_unit, amount)), 2) AS total,
+               count(DISTINCT log_date) AS days
+        FROM habit_logs
+        WHERE habit = 'reading' AND log_date BETWEEN DATE '2026-09-01' AND DATE '2026-09-24'
+        GROUP BY 1
+    - question: "what is my reading pattern"
+      sql: |
+        SELECT weekday_name, count(DISTINCT log_date) AS days_read,
+               round(sum(coalesce(amount_in_habit_unit, amount)), 2) AS total,
+               round(avg(coalesce(amount_in_habit_unit, amount)), 2) AS avg_per_log
+        FROM habit_logs
+        WHERE habit = 'reading'
+        GROUP BY weekday, weekday_name
+        ORDER BY weekday
+    - question: "how many hours did I work each week this month"
+      sql: |
+        SELECT week_start, round(sum(coalesce(amount_in_habit_unit, amount)), 2) AS hours
+        FROM habit_logs
+        WHERE habit = 'work' AND log_date BETWEEN DATE '2026-09-01' AND DATE '2026-09-24'
+        GROUP BY week_start
+        ORDER BY week_start
+    - question: "which habit did I do most often last week"
+      sql: |
+        SELECT habit_display, count(DISTINCT log_date) AS days
+        FROM habit_logs
+        WHERE log_date BETWEEN DATE '2026-09-14' AND DATE '2026-09-20'
+        GROUP BY habit_display
+        ORDER BY days DESC
+    - question: "my longest running streak"
+      sql: |
+        WITH d AS (SELECT DISTINCT log_date FROM habit_logs WHERE habit = 'running'),
+             g AS (SELECT log_date, log_date - (row_number() OVER (ORDER BY log_date))::int AS grp FROM d)
+        SELECT min(log_date) AS started, max(log_date) AS ended, count(*) AS days
+        FROM g GROUP BY grp ORDER BY days DESC, ended DESC LIMIT 1
+    - question: "which days this week did I skip meditation"
+      sql: |
+        SELECT d::date AS day, trim(to_char(d, 'Day')) AS weekday
+        FROM generate_series(DATE '2026-09-21', DATE '2026-09-24', INTERVAL '1 day') AS d
+        WHERE NOT EXISTS (SELECT 1 FROM habit_logs l WHERE l.habit = 'meditation' AND l.log_date = d::date)
+        ORDER BY day
+
+# ------------------------------------------------------------
+# Answer: turn the rows into a reply.
+# ------------------------------------------------------------
+answer:
+  rules:
+    - "answer the question directly in 1-3 short sentences, using ONLY the numbers in ROWS; never invent or estimate"
+    - "say amounts with their units (\"320 pages\", \"12.5 hours\") and name the period (\"this month\", \"last week\")"
+    - "for patterns, point out the highlight (best day, trend up or down, consistency) in plain words"
+    - "if ROWS is empty, say nothing was logged for that and suggest logging, e.g. \"No reading logged this month yet.\""
+    - "if TRUNCATED is true, say these are the first rows only"
+    - "friendly and encouraging, no markdown tables (the app shows the table), at most one emoji"

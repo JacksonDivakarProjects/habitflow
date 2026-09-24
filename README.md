@@ -3,24 +3,27 @@
 A personal habit tracker you talk to on Telegram. Send plain text like
 "ran 4 miles yesterday"; an LLM turns it into a structured log entry, you
 review the draft (including the SQL it wrote), and nothing is saved until
-you tap **Approve**.
+you tap **Save**. Ask "how much did I read this month?" or "what's my
+reading pattern?" and it writes a read-only query, runs it on your data and
+answers, with the SQL one tap away.
 
 ```
 Telegram ──> bot ──HTTP──> api ──HTTP──> llm ──> Groq (Llama 3.3 70B)
                             │
-                            └──> Postgres (habits, daily_logs, audit_log)
+                            └──> Postgres (habits, daily_logs, audit_log,
+                                          habit_logs view, query_log)
 ```
 
 | Service | What it does |
 |---|---|
 | `bot/` | Telegram front end (python-telegram-bot). Single allowed user. |
-| `api/` | FastAPI. Drafting loop, validation, approval state machine, writes. |
+| `api/` | FastAPI. Message routing, drafting loop, validation, approval state machine, writes; question answering over a read-only view. |
 | `llm/` | FastAPI wrapper around Groq. Builds the prompt from `semantics.yaml`. |
 | `api/migrations/` | The whole schema and starter habits, applied by the API at startup. |
 
 **Setting it up, using it, running it or fixing it?** See the
-[usage guide and SOP](docs/SOP.md), including how
-[reminders and time zones](docs/SOP.md#3-reminders-and-time) work.
+[usage guide and SOP](docs/SOP.md), including
+[what you can ask](docs/SOP.md#3-asking-about-your-routine).
 
 ## How a message becomes a log
 
@@ -31,21 +34,22 @@ Telegram ──> bot ──HTTP──> api ──HTTP──> llm ──> Groq (L
    is sent back to the LLM and it tries again, up to 3 attempts.
 2. **Fill gaps.** If the unit is missing, the bot asks for one. If the habit is
    unknown, the bot offers to create it.
-3. **Review.** You get a card showing the preview and the SQL. **✏️ Edit**
-   lets you reply with a correction and regenerates the draft in place
-   (Loop 2). **🗑️ Discard** drops it. **✅ Approve** writes it.
+3. **Review.** You get a card with one line per log. **✏️ Change** takes a
+   correction (typed, or a one-tap "It was yesterday") and regenerates the
+   draft (Loop 2). **✖ Cancel** drops it. **🔍 SQL** shows the draft SQL.
+   **✅ Save** writes it.
 4. **Execute.** `api` builds its own parameterized `INSERT` from the validated
    fields. The LLM's SQL is only shown and dry-run checked, never executed.
    The confirmation shows your streak and weekly total, plus a **↩️ Undo**
    button.
 
 **Several habits at once.** "ran 3 miles and read 20 pages" becomes one card
-with one line per log. Approve saves them all, and one Undo reverts them all.
+with one line per log. Save stores them all, and one Undo reverts them all.
 A part that can't be logged directly, such as a brand-new habit, is listed
 under *Not included* with the reason, so you can send it on its own.
 
 **Edits never lose your draft.** If a correction can't be applied, the
-original card stays approvable and you can simply try again. Every
+original card stays saveable and you can simply try again. Every
 correction is recorded in the draft's `feedback_history`.
 
 **Units.** The LLM decides the unit before anything is stored: it
@@ -76,6 +80,50 @@ that reads from nothing but `habits` is accepted. That rules out
 multi-statement input, CTEs, `ON CONFLICT`, unknown functions (`pg_sleep`,
 `pg_read_file`, ...) and any write to another table. SQL that passes is
 `EXPLAIN`ed inside a savepoint. It is never run.
+
+## How a question becomes an answer
+
+Ask in plain words: "how much did I read this month?", "what's my reading
+pattern?", "how many hours did I work last week?".
+
+1. **Route.** `POST /internal/message` classifies every message
+   (`api/app/intents.py`): rules take the clear cases instantly (question
+   words, "?", "pattern", "average"; an amount with a habit or unit is a log),
+   and only unclear ones ask the LLM's `/classify`. With the LLM down, a
+   number means a log and anything else is treated as a question.
+2. **SQL first.** A simple total for one habit and one period ("how much /
+   how many hours / did I … this week") uses a fixed template: exact, instant,
+   and it works with the LLM offline. Anything else goes to the LLM's
+   `/query_sql`, which gets the schema of the `habit_logs` view, your habits,
+   and literal dates for "today", "this week", "this month" in `APP_TIMEZONE`.
+3. **Check and run.** The SQL must pass `check_select_sql` (below), then runs
+   in a `READ ONLY` transaction with a 3-second statement timeout. Rejected or
+   failing SQL goes back to the LLM with the reason, up to 3 attempts.
+4. **Answer.** The LLM's `/answer` phrases the rows (a plain summary if it's
+   down). The bot shows the sentence, a small table when there are several
+   rows, and a **🔍 SQL** button with the exact query. Every question, its SQL,
+   row count and answer are stored in `query_log`.
+
+**The `habit_logs` view** (`api/migrations/0004_query_views.sql`) is the only
+data questions can read, together with `habits`. It excludes undone logs,
+resolves an old bare `m` to meters or minutes, and adds
+`amount_in_habit_unit` (every log converted to its habit's unit through the
+`unit_conversions` table), plus `weekday`, `week_start` and `month_start` for
+patterns. Amounts that can't be converted stay separate instead of being
+added to the wrong total.
+
+### SQL safety for questions
+
+`check_select_sql` (`api/app/sqlguard.py`) accepts exactly one `SELECT`
+(CTEs, window functions and `UNION` are fine) that reads only `habit_logs`,
+`habits`, its own CTEs and `generate_series`. It uses a **whitelist** of
+functions, so `pg_sleep`, `pg_read_file`, `set_config`, `version()`,
+`dblink` and anything else not listed are rejected. It also rejects system
+catalogs, other schemas, `SELECT INTO`, `FOR UPDATE`, and
+`CURRENT_DATE`/`NOW()` (dates must be the literals the API provides, so the
+answer matches the app's time zone). A row limit of 200 is added or capped.
+The `READ ONLY` transaction and timeout back this up if a check were ever
+missed.
 
 ## Setup
 
@@ -134,7 +182,7 @@ setup, which keeps using `.env` and its own database.
 | Render free web service rule | What the image does |
 |---|---|
 | Must listen on `$PORT` (Render sets it) | Serves a status page there: `/` ("HabitFlow is running.") and `/healthz` (JSON). Nothing else is public; the API and `/internal/*` stay on 127.0.0.1 inside the container |
-| Sleeps after 15 min without inbound HTTP requests | The bot polls Telegram, which is outbound. So every 10 minutes the container requests its own public URL (`RENDER_EXTERNAL_URL`, set by Render) and stays awake, and the bot and 9 pm reminders keep working. `/healthz` shows `keep_awake.pings_ok` |
+| Sleeps after 15 min without inbound HTTP requests | The bot polls Telegram, which is outbound. So every 10 minutes the container requests its own public URL (`RENDER_EXTERNAL_URL`, set by Render) and stays awake, and the bot keeps working. `/healthz` shows `keep_awake.pings_ok` |
 | Temporary filesystem, wiped on deploys | `DATABASE_URL` points at Neon, so the built-in database isn't used. Without it, the logs warn loudly |
 | 750 free hours a month per workspace | One service awake all month uses about 730 hours. Don't run a second free service in the same workspace |
 
@@ -198,7 +246,7 @@ Directory** `.`. Everything else is the same; Render builds the image itself.
   ```
 - Message your Render bot `/start`, then log something (`ran 3 miles`). In
   Neon's *Tables* view, `habits`, `daily_logs`, `audit_log`,
-  `reminder_settings` and `schema_migrations` now exist.
+  `query_log`, `unit_conversions` and `schema_migrations` now exist (plus the `habit_logs` view).
 
 Startup takes a minute or two on the free instance (0.1 CPU). **Optional
 backup for keep-awake:** a free monitor such as [UptimeRobot](https://uptimerobot.com)
@@ -249,16 +297,18 @@ uses and stays within its free compute.
 
 | Send | Result |
 |---|---|
-| `ran 4 miles` | Card: *4 miles of Running today* → ✅ → *🔥 3-day streak · 12 miles this week* |
-| `read 20` | Uses the default unit (pages), marked *(suggested unit)* |
+| `ran 4 miles` | Card: *Running · 4 miles · today* → ✅ Save → *🔥 3-day streak · 12 miles this week* |
+| `read 20` | Uses the default unit (pages), noted as guessed |
+| `ran 4` (no unit known) | "What unit?" with one-tap unit buttons |
 | `learned rust for 2 hours` | Offers to create a *Learning Rust* habit (and asks for a unit if it can't tell) |
 | `/today` | What you've logged today |
 | `/stats` | Totals and streaks for the last 30 days |
 | `/undo` | Void your most recent log (it stays in the audit trail) |
-| `ran 3 miles and read 20 pages` | One card with two lines; Approve logs both |
+| `ran 3 miles and read 20 pages` | One card with two lines; Save logs both |
+| `how much did I read this month?` | *60 pages of Reading this month, on 12 days.* + 🔍 SQL |
+| `what's my reading pattern` | A sentence plus a small table by weekday |
 | `/habits` | Tracked habits and their default units |
-| `/remind 21:00` (or `9pm`) | A daily evening check-in, sent only if a streak is at risk or something is unlogged. `/remind off` stops it; `/remind` shows the setting |
-| `/cancel`, or reply “cancel” | Drop an open unit question or edit |
+| `/cancel`, or reply “cancel” | Drop an open unit question or change |
 
 Errors are shown in plain language, for example "This draft was replaced by
 a newer one." Errors from a button press appear as a popup, so the card
@@ -279,9 +329,9 @@ ruff check .                                               # from repo root
 
 | Suite | What it covers |
 |---|---|
-| `api/tests` | Every draft, clarify, approve, edit, undo, discard and reminder path; the SQL guard; units and the regex parser; migrations. `test_feedback.py` covers the ✏️ Edit flow on its own. |
-| `llm/tests` | Prompt construction, the `/extract` endpoint, and the eval scorer. |
-| `bot/tests` | Every handler and button with a faked API: wording, error popups, "cancel" words, reminders and scheduling. |
+| `api/tests` | Every draft, clarify, approve, change, undo and discard path; message routing (`test_intents.py`, `test_messages.py`); questions end to end: the view, dates, templates, the LLM SQL path with retries, read-only execution and timeouts (`test_querying.py`); both SQL guards including attack cases (`test_select_guard.py`); units, the regex parser, migrations. |
+| `llm/tests` | Prompt construction, the `/extract`, `/classify`, `/query_sql` and `/answer` endpoints, and the eval scorers. |
+| `bot/tests` | Rendering (cards, tables, escaping) and every handler and button with a faked API: wording, popups, "cancel" words, questions asked mid-conversation. |
 | `e2e` | Whole conversations. The real bot handlers call the real API (in process) over a real database, with only Telegram and the LLM scripted. A small `Chat` simulator records every message, button and edit. |
 
 ### LLM evals
@@ -295,7 +345,15 @@ corrections, each with the expected intent. To score the real model
 cd llm && GROQ_API_KEY=... python -m evals.run --min-pass 0.9
 ```
 
-Run it after changing `semantics.yaml` or `GROQ_MODEL_NAME`. It is not run
+`llm/evals/question_cases.yaml` does the same for questions: routing of
+unclear messages, and text-to-SQL checked for the right habit, period and
+shape, and against the API's guard:
+
+```bash
+cd llm && GROQ_API_KEY=... python -m evals.questions --min-pass 0.9
+```
+
+Run them after changing `semantics.yaml` or `GROQ_MODEL_NAME`. It is not run
 in CI because it needs a key and costs tokens.
 
 The API tests need a real Postgres, because the schema relies on JSONB,

@@ -1,11 +1,27 @@
+"""
+HabitFlow Telegram bot: a thin client over the API.
+
+Every message goes to POST /internal/message, which decides what it is:
+  log     -> a draft card:      ✅ Save  ✏️ Change  ✖ Cancel  🔍 SQL
+  answer  -> the answer, a small table when there are rows, and 🔍 SQL
+  chat    -> help
+Two short conversations are tracked in user_data: a unit question (answer
+with a button or by typing) and a change to a draft (a quick-fix button or a
+typed correction). A question asked in the middle of either is answered
+without dropping it.
+
+Sections: config · API · rendering (pure, HTML) · handlers · main.
+"""
+
+import html
 import logging
-from datetime import time as dtime
-from zoneinfo import ZoneInfo
+import re
+from datetime import date
 
 import httpx
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -16,15 +32,17 @@ from telegram.ext import (
 )
 
 
+# ------------------------------------------------------------------
+# Config
+# ------------------------------------------------------------------
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     telegram_bot_token: str
     telegram_allowed_user_id: int
     api_base_url: str = "http://api:8000"
-    # Calls that hit the LLM: API worst case is 3 retries x LLM_TIMEOUT_SECONDS (20s).
+    # Calls that may use the LLM: a question can take up to 3 SQL attempts + an answer.
     api_llm_timeout_seconds: float = 90
-    app_timezone: str = "Asia/Kolkata"  # reminder times are in this zone
 
 
 settings = Settings()
@@ -36,39 +54,69 @@ logging.basicConfig(
 log = logging.getLogger("habitflow.bot")
 
 EXAMPLES = "“ran 3 miles” or “read 20 pages yesterday”"
-COULDNT_UNDERSTAND = f"Sorry, I couldn't turn that into a log. Try something like {EXAMPLES}."
 UNREACHABLE = "I can't reach the server right now. Please try again in a moment."
+COULDNT_UNDERSTAND = f"Sorry, I couldn't turn that into a log. Try something like {EXAMPLES}."
 
 COMMANDS = [
     ("today", "What you've logged today"),
     ("stats", "Last 30 days and streaks"),
     ("undo", "Undo your last log"),
     ("habits", "Your habits and their units"),
-    ("remind", "Daily check-in, e.g. /remind 21:00"),
     ("cancel", "Cancel the current question"),
     ("help", "How to use HabitFlow"),
 ]
 
-# Typed instead of an answer to a question, these mean /cancel.
-CANCEL_WORDS = {"cancel", "never mind", "nevermind", "nvm", "stop", "forget it", "skip"}
+# Typed instead of an answer, these mean /cancel.
+CANCEL_WORDS = {"cancel", "never mind", "nevermind", "nvm", "stop", "forget it", "skip", "no"}
+# A question typed while a unit question or a change is open is answered, and
+# the open conversation is kept.
+_QUESTION = re.compile(
+    r"(\?\s*$)|^(how|what|what's|whats|when|which|why|show|list|compare|summari[sz]e|"
+    r"(did|do|have|has|am|was|is|are)\s+(i|my)\b)",
+    re.IGNORECASE,
+)
+
+TABLE_MAX_ROWS = 15
+TABLE_MAX_COLS = 5
+TABLE_CELL_WIDTH = 16
+
+# Buttons from cards sent by older versions keep working.
+LEGACY_ACTIONS = {
+    "approve": "save",
+    "feedback": "change",
+    "discard": "cancel",
+    "create_habit": "create",
+    "cancel_habit": "nocreate",
+}
 
 
 def _is_cancel(text: str | None) -> bool:
     return (text or "").strip().lower().rstrip("!.") in CANCEL_WORDS
 
 
+def _looks_like_question(text: str | None) -> bool:
+    """A one-word reply ("km?") is an unsure answer, not a question."""
+    text = (text or "").strip()
+    return len(text.split()) > 1 and bool(_QUESTION.search(text))
+
+
 def authorized(update: Update) -> bool:
-    if update.effective_user is None:
-        return False
-    return update.effective_user.id == settings.telegram_allowed_user_id
+    return update.effective_user is not None and (
+        update.effective_user.id == settings.telegram_allowed_user_id
+    )
 
 
-def _escape_md(s: str) -> str:
-    if not s:
-        return s
-    for ch in ("_", "*", "[", "]", "`"):
-        s = s.replace(ch, "\\" + ch)
-    return s
+# ------------------------------------------------------------------
+# API
+# ------------------------------------------------------------------
+async def _post(path: str, payload: dict, timeout: float = 30) -> httpx.Response:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        return await client.post(f"{settings.api_base_url}{path}", json=payload)
+
+
+async def _get(path: str, params: dict | None = None, timeout: float = 10) -> httpx.Response:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        return await client.get(f"{settings.api_base_url}{path}", params=params)
 
 
 def _detail(r: httpx.Response):
@@ -79,29 +127,290 @@ def _detail(r: httpx.Response):
 
 
 def _friendly_error(r: httpx.Response) -> str:
-    """Turn an API error into something a person can act on. Never raw JSON."""
-    try:
-        detail = str(r.json().get("detail", ""))
-    except Exception:
-        detail = ""
+    """An API error as something a person can act on. Never raw JSON."""
+    detail = _detail(r)
+    detail = str(detail) if detail is not None else ""
     log.warning("API %s: %s", r.status_code, detail or r.text)
     if r.status_code == 404:
-        return "I can't find that anymore. Send your log again."
+        return "I can't find that anymore. Send it again."
     if r.status_code == 409:
         if "superseded" in detail:
             return "This draft was replaced by a newer one."
         if "executed" in detail:
-            return "That's already logged. ✅"
+            return "That's already saved. ✅"
         if "cancelled" in detail:
-            return "This draft was discarded."
+            return "This draft was cancelled."
         return "This draft is no longer active. Send your log again."
     if r.status_code == 422:
         return COULDNT_UNDERSTAND
     return "Something went wrong on my side. Please try again in a moment."
 
 
+# ------------------------------------------------------------------
+# Rendering (pure: data in, (HTML text, keyboard) out)
+# ------------------------------------------------------------------
+def h(value) -> str:
+    return html.escape(str(value), quote=False)
+
+
+_SINGULAR = {  # units are stored plural; mirrors api/app/units.py
+    "miles": "mile",
+    "meters": "meter",
+    "minutes": "minute",
+    "hours": "hour",
+    "seconds": "second",
+    "pages": "page",
+    "books": "book",
+    "chapters": "chapter",
+    "steps": "step",
+    "reps": "rep",
+    "sets": "set",
+    "concepts": "concept",
+    "glasses": "glass",
+    "liters": "liter",
+    "calories": "calorie",
+    "laps": "lap",
+}
+
+
+def _qty(amount: float, unit: str) -> str:
+    """'1 mile', '2 miles'."""
+    amount = float(amount)
+    return f"{amount:g} {_SINGULAR.get(unit, unit) if amount == 1 else unit}"
+
+
+def _keyboard(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(text, callback_data=data) for text, data in row]
+            for row in rows
+            if row
+        ]
+    )
+
+
+def _item_line(item: dict) -> str:
+    return f"• <b>{h(item['habit'])}</b> · {h(item['quantity'])} · {h(item['when'])}"
+
+
+def _items(data: dict) -> list[dict]:
+    """Card lines; older API responses only had the preview text."""
+    if data.get("items"):
+        return data["items"]
+    return [
+        {"habit": line, "quantity": "", "when": ""}
+        for line in (data.get("preview") or "").splitlines()
+    ]
+
+
+def card_markup(audit_id: int, sql_button: bool = True) -> InlineKeyboardMarkup:
+    return _keyboard(
+        [
+            ("✅ Save", f"save:{audit_id}"),
+            ("✏️ Change", f"change:{audit_id}"),
+            ("✖ Cancel", f"cancel:{audit_id}"),
+        ],
+        [("🔍 SQL", f"sql:{audit_id}")] if sql_button else [],
+    )
+
+
+def render_card(
+    data: dict, header: str = "📝 <b>Log this?</b>"
+) -> tuple[str, InlineKeyboardMarkup]:
+    items = _items(data)
+    if data.get("items"):
+        lines = [_item_line(i) for i in items]
+    else:
+        lines = [f"• {h(i['habit'])}" for i in items]
+    text = header + "\n" + "\n".join(lines)
+    if data.get("metric_source") == "suggested":
+        text += "\n<i>Unit guessed from your habit. Tap ✏️ Change if it's wrong.</i>"
+    if data.get("skipped"):
+        text += "\n⚠️ Not included: " + h("; ".join(data["skipped"]))
+    if data.get("offline"):
+        text += "\n⚡ <i>The AI is offline, so the simple parser read this. Please check it.</i>"
+    return text, card_markup(data["audit_id"])
+
+
+def render_unit_question(data: dict) -> tuple[str, InlineKeyboardMarkup]:
+    audit_id = data["audit_id"]
+    options = data.get("unit_options") or []
+    buttons = [(u, f"unit:{audit_id}:{u}") for u in options[:6]]
+    rows = [buttons[:3], buttons[3:6], [("✖ Cancel", f"cancel:{audit_id}")]]
+    return f"❓ {h(data['prompt'])}\n<i>Tap a unit or type it.</i>", _keyboard(*rows)
+
+
+def render_habit_question(data: dict) -> tuple[str, InlineKeyboardMarkup]:
+    audit_id = data["audit_id"]
+    return f"✨ {h(data['prompt'])}", _keyboard(
+        [("✨ Create habit", f"create:{audit_id}"), ("✖ No", f"nocreate:{audit_id}")]
+    )
+
+
+def render_draft(data: dict) -> tuple[str, InlineKeyboardMarkup]:
+    """Whatever a DraftResponse asks for: a unit, a new habit, or approval."""
+    if data.get("needs_input") == "unit":
+        return render_unit_question(data)
+    if data.get("needs_input") == "habit":
+        return render_habit_question(data)
+    return render_card(data)
+
+
+def render_change_prompt(audit_id: int, card_text: str) -> tuple[str, InlineKeyboardMarkup]:
+    lines = [ln for ln in card_text.splitlines() if ln.startswith("•")]
+    what = h("\n".join(lines)) if lines else ""
+    text = (
+        "✏️ <b>What should change?</b>\n"
+        + (f"{what}\n" if what else "")
+        + "Type the fix, like “6 miles”, “it was yesterday” or “reading, not running”."
+    )
+    return text, _keyboard(
+        [
+            ("📅 It was yesterday", f"fix:{audit_id}:yesterday"),
+            ("📅 It was today", f"fix:{audit_id}:today"),
+        ],
+        [("↩️ Keep as is", f"keep:{audit_id}")],
+    )
+
+
+QUICK_FIXES = {"yesterday": "it was yesterday", "today": "it was today"}
+
+
+def render_saved(data: dict) -> tuple[str, InlineKeyboardMarkup | None]:
+    summaries = data.get("summaries") or ([data["summary"]] if data.get("summary") else [])
+    lines = ["✅ <b>Saved</b>"]
+    for s in summaries:
+        lines.append(
+            f"• <b>{h(s['habit'])}</b> · {h(_qty(s['amount'], s['metric']))} · {h(s['when'])}"
+        )
+        streak = s.get("streak_days") or 0
+        progress = []
+        if streak >= 2:
+            progress.append(f"🔥 {streak}-day streak")
+        elif streak == 1:
+            progress.append("🌱 day 1 of a new streak")
+        if s.get("week_total"):
+            progress.append(f"{_qty(s['week_total'], s['metric'])} this week")
+        if progress:
+            lines.append("   " + h(" · ".join(progress)))
+    log_ids = data.get("log_ids") or []
+    if len(log_ids) > 1:
+        undo = f"undo_audit:{data['audit_id']}" if data.get("audit_id") else None
+    else:
+        undo = f"undo:{data['log_id']}" if data.get("log_id") else None
+    return "\n".join(lines), (_keyboard([("↩️ Undo", undo)]) if undo else None)
+
+
+def _cell(value) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, float):
+        return f"{round(value, 2):g}"
+    if isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        d = date.fromisoformat(value)
+        return f"{d:%a} {d.day} {d:%b}"
+    return str(value)
+
+
+def format_table(columns: list[str], rows: list[list]) -> str:
+    """A small monospace table: numbers right-aligned, long cells cut."""
+    cols = columns[:TABLE_MAX_COLS]
+    shown = [r[:TABLE_MAX_COLS] for r in rows[:TABLE_MAX_ROWS]]
+    cells = [[_cell(v) for v in r] for r in shown]
+    headers = [c.replace("_", " ") for c in cols]
+
+    def cut(s: str) -> str:
+        return s if len(s) <= TABLE_CELL_WIDTH else s[: TABLE_CELL_WIDTH - 1] + "…"
+
+    headers = [cut(x) for x in headers]
+    cells = [[cut(x) for x in r] for r in cells]
+    widths = [max([len(headers[i])] + [len(r[i]) for r in cells]) for i in range(len(cols))]
+    numeric = [
+        all(
+            isinstance(r[i], (int, float)) and not isinstance(r[i], bool) or r[i] is None
+            for r in shown
+        )
+        and any(r[i] is not None for r in shown)
+        for i in range(len(cols))
+    ]
+
+    def line(values: list[str]) -> str:
+        return "  ".join(
+            v.rjust(widths[i]) if numeric[i] else v.ljust(widths[i]) for i, v in enumerate(values)
+        ).rstrip()
+
+    out = [line(headers), "  ".join("─" * w for w in widths)] + [line(r) for r in cells]
+    if len(rows) > TABLE_MAX_ROWS:
+        out.append(f"… and {len(rows) - TABLE_MAX_ROWS} more")
+    if len(columns) > TABLE_MAX_COLS:
+        out.append(f"({len(columns) - TABLE_MAX_COLS} more columns not shown)")
+    return "\n".join(out)
+
+
+def render_answer(data: dict) -> tuple[str, InlineKeyboardMarkup | None]:
+    icon = "💬" if data.get("ok") else "🤔"
+    text = f"{icon} {h(data.get('answer') or 'No answer.')}"
+    rows = data.get("rows") or []
+    if data.get("ok") and data.get("source") != "template" and len(rows) >= 2:
+        text += f"\n<pre>{h(format_table(data.get('columns') or [], rows))}</pre>"
+    markup = None
+    if data.get("sql") and data.get("query_id"):
+        markup = _keyboard([("🔍 SQL", f"qsql:{data['query_id']}")])
+    return text, markup
+
+
+def render_sql(title: str, sql: str) -> str:
+    return f"🔍 <b>{h(title)}</b>\n<pre>{h(sql.strip())}</pre>"
+
+
+HELP_TEXT = (
+    "<b>Log</b> what you did, in plain words:\n"
+    "  “ran 4 miles” · “read 20 pages yesterday”\n"
+    "  “meditated 10 min and 30 pushups” (several at once)\n"
+    "  “learned rust for 2 hours” (new habits are created for you)\n"
+    "You'll get a card: ✅ Save · ✏️ Change · ✖ Cancel. Nothing is saved until you tap ✅, "
+    "and ↩️ Undo is there afterwards.\n\n"
+    "<b>Ask</b> about your routine:\n"
+    "  “how much did I read this month?”\n"
+    "  “what's my reading pattern?”\n"
+    "  “how many hours did I work last week?”\n"
+    "  “which days did I skip meditation?”\n"
+    "Tap 🔍 SQL to see exactly how it was counted.\n\n"
+    "<b>Commands</b>\n" + "\n".join(f"  /{name} — {h(desc)}" for name, desc in COMMANDS)
+)
+
+
+# ------------------------------------------------------------------
+# Sending
+# ------------------------------------------------------------------
+def _plain(text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+async def _reply(message, text: str, markup=None):
+    """Reply in HTML; if Telegram rejects the markup, send it as plain text."""
+    try:
+        return await message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+    except Exception:
+        log.warning("HTML reply failed; sending plain text")
+        return await message.reply_text(_plain(text), reply_markup=markup)
+
+
+async def _edit(query, text: str, markup=None):
+    try:
+        await query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+    except Exception:
+        log.warning("HTML edit failed; editing as plain text")
+        try:
+            await query.edit_message_text(_plain(text), reply_markup=markup)
+        except Exception:
+            log.warning("could not edit message")
+
+
 async def _typing(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show "typing…" while the LLM works. Cosmetic: never let it fail a request."""
+    """Show "typing…" while the API works. Cosmetic: never let it fail a request."""
     try:
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id, action=ChatAction.TYPING
@@ -110,215 +419,126 @@ async def _typing(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-def _card_markup(audit_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Approve", callback_data=f"approve:{audit_id}"),
-                InlineKeyboardButton("✏️ Edit", callback_data=f"feedback:{audit_id}"),
-                InlineKeyboardButton("🗑️ Discard", callback_data=f"discard:{audit_id}"),
-            ]
-        ]
-    )
+async def _clear_buttons(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id):
+    """Remove the buttons from an earlier prompt that no longer applies."""
+    if not message_id:
+        return
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=chat_id, message_id=message_id, reply_markup=None
+        )
+    except Exception:
+        pass
 
 
-def _undo_markup(callback_data: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("↩️ Undo", callback_data=callback_data)]]
-    )
+# ------------------------------------------------------------------
+# Conversation state
+# ------------------------------------------------------------------
+UNIT = "awaiting_unit"  # {"audit_id", "message_id"}
+EDIT = "editing"  # {"audit_id", "card_message_id", "prompt_message_id"}
 
 
-def _format_card(
-    audit_id: int,
-    preview: str,
-    metric_source: str,
-    draft_sql: str | None,
-    offline: bool = False,
-    skipped: list[str] | None = None,
-) -> str:
-    lines = preview.splitlines() or [preview]
-    suffix = " _(suggested unit)_" if metric_source == "suggested" else ""
-    body = "\n".join(
-        f"📝 {_escape_md(line)}{suffix if i == 0 else ''}" for i, line in enumerate(lines)
-    )
-    if skipped:
-        body += "\n\n⚠️ Not included: " + _escape_md("; ".join(skipped))
-    if offline:
-        body += "\n\n⚡ _AI is offline, so this was read by the simple parser. Please check it._"
-    body += f"\n\n_Draft #{audit_id}_"
-    if draft_sql:
-        body += f"\n\n```sql\n{draft_sql.strip()}\n```"
-    return body
+async def _drop_state(context: ContextTypes.DEFAULT_TYPE, chat_id: int, key: str):
+    state = context.user_data.pop(key, None)
+    if state:
+        await _clear_buttons(
+            context, chat_id, state.get("message_id") or state.get("prompt_message_id")
+        )
+    return state
 
 
-def _card_text(data: dict) -> str:
-    return _format_card(
-        data["audit_id"],
-        data["preview"],
-        data.get("metric_source", "explicit"),
-        data.get("draft_sql"),
-        offline=data.get("offline", False),
-        skipped=data.get("skipped"),
-    )
+async def _show_draft(message, context: ContextTypes.DEFAULT_TYPE, data: dict):
+    """Send a DraftResponse and remember a unit question if it is one."""
+    text, markup = render_draft(data)
+    sent = await _reply(message, text, markup)
+    if data.get("needs_input") == "unit":
+        context.user_data[UNIT] = {
+            "audit_id": data["audit_id"],
+            "message_id": getattr(sent, "message_id", None),
+        }
 
 
-_SINGULAR = {  # units are stored plural; mirrors api/app/units.py
-    "miles": "mile", "meters": "meter", "minutes": "minute", "hours": "hour",
-    "seconds": "second", "pages": "page", "books": "book", "chapters": "chapter",
-    "steps": "step", "reps": "rep", "sets": "set", "concepts": "concept",
-    "glasses": "glass", "liters": "liter", "calories": "calorie", "laps": "lap",
-}
-
-
-def _qty(amount: float, unit: str) -> str:
-    """'1 mile', '2 miles'."""
-    return f"{amount:g} {_SINGULAR.get(unit, unit) if amount == 1 else unit}"
-
-
-def _format_logged(summary: dict) -> str:
-    s = summary
-    lines = [f"✅ Logged {_qty(s['amount'], s['metric'])} of {s['habit']} {s['when']}"]
-    streak = s.get("streak_days") or 0
-    parts = []
-    if streak >= 2:
-        parts.append(f"🔥 {streak}-day streak")
-    elif streak == 1:
-        parts.append("🌱 Day 1 of a new streak")
-    parts.append(f"{_qty(s['week_total'], s['metric'])} this week")
-    lines.append(" · ".join(parts))
-    return "\n".join(lines)
-
-
-def _format_executed(data: dict) -> str:
-    summaries = data.get("summaries") or [data["summary"]]
-    return "\n\n".join(_format_logged(s) for s in summaries)
-
-
-def format_reminder(check: dict) -> str | None:
-    """Evening check-in text, or None when there's nothing worth saying."""
-    if not check["at_risk"] and not check["not_logged"]:
-        return None
-    lines = ["⏰ Evening check-in"]
-    for item in check["at_risk"]:
-        days = item["streak_days"]
-        if days > 1:
-            lines.append(f"🔥 {item['habit']}: log it today to keep your {days}-day streak going.")
-        else:
-            lines.append(
-                f"🌱 {item['habit']}: you started yesterday. Log it today to make it 2 days."
-            )
-    if check["not_logged"]:
-        lines.append("Not logged yet today: " + ", ".join(check["not_logged"]) + ".")
-    if check.get("done"):
-        lines.append("✅ Done today: " + ", ".join(check["done"]) + ".")
-    lines.append("Just reply here, like “ran 3 miles”.")
-    return "\n".join(lines)
-
-
+# ------------------------------------------------------------------
+# Commands
+# ------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
-    await update.message.reply_text(
-        "👋 HabitFlow is ready.\n\n"
-        f"Just tell me what you did, like {EXAMPLES}. "
-        "I'll show you a draft, and nothing is saved until you tap ✅.\n\n"
-        "Try /today, /stats or /help. Want an evening nudge? /remind 21:00"
+    await _reply(
+        update.message,
+        "👋 <b>HabitFlow is ready.</b>\n\n"
+        f"Tell me what you did, like {h(EXAMPLES)}, and tap ✅ to save it.\n"
+        "Or ask things like “how much did I read this month?”.\n\n"
+        "/help shows everything.",
     )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
-    await update.message.reply_text(
-        "Tell me what you did in plain words:\n"
-        "  “ran 4 miles”\n"
-        "  “read 20 pages yesterday”\n"
-        "  “meditated 10 min”\n"
-        "  “learned rust for 2 hours” (new habits are created for you)\n"
-        "  “ran 3 miles and read 20 pages” (several at once)\n\n"
-        "Each draft card has three buttons:\n"
-        "  ✅ Approve saves it\n"
-        "  ✏️ Edit lets you reply with a fix, like “6 miles, not 4”\n"
-        "  🗑️ Discard throws it away\n"
-        "After saving you can tap ↩️ Undo, or send /undo later.\n"
-        "Answering a question? Reply “cancel” to drop it.\n\n"
-        "Commands:\n"
-        + "\n".join(f"  /{name} — {desc}" for name, desc in COMMANDS)
-    )
+    await _reply(update.message, HELP_TEXT)
+
+
+async def _simple_get(update: Update, path: str, params: dict | None = None):
+    try:
+        r = await _get(path, params)
+    except Exception:
+        log.exception("%s call failed", path)
+        await update.message.reply_text(UNREACHABLE)
+        return None
+    if r.status_code != 200:
+        await update.message.reply_text(_friendly_error(r))
+        return None
+    return r.json()
 
 
 async def habits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"{settings.api_base_url}/internal/habits")
-    except Exception:
-        log.exception("habits call failed")
-        await update.message.reply_text(UNREACHABLE)
+    habits = await _simple_get(update, "/internal/habits")
+    if habits is None:
         return
-    if r.status_code != 200:
-        await update.message.reply_text(_friendly_error(r))
-        return
-    habits = r.json()
     if not habits:
         await update.message.reply_text(
             f"No habits yet. Log something like {EXAMPLES} and I'll create it."
         )
         return
     lines = [
-        f"• {h['display_name']} ({h.get('metric') or 'no default unit'})" for h in habits
+        f"• <b>{h(x['display_name'])}</b> · {h(x.get('metric') or 'no default unit')}"
+        for x in habits
     ]
-    await update.message.reply_text("Tracked habits:\n" + "\n".join(lines))
+    await _reply(update.message, "📋 <b>Your habits</b>\n" + "\n".join(lines))
 
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                f"{settings.api_base_url}/internal/stats",
-                params={"chat_id": update.effective_chat.id},
-            )
-    except Exception:
-        log.exception("stats call failed")
-        await update.message.reply_text(UNREACHABLE)
+    rows = await _simple_get(update, "/internal/stats", {"chat_id": update.effective_chat.id})
+    if rows is None:
         return
-    if r.status_code != 200:
-        await update.message.reply_text(_friendly_error(r))
-        return
-    rows = r.json()
     if not rows:
         await update.message.reply_text("No logs in the last 30 days. Send one to get started!")
         return
-    lines = ["📊 Last 30 days:"]
+    lines = ["📊 <b>Last 30 days</b>"]
     for row in rows:
         days = row["days"]
         line = (
-            f"• {row['habit']}: {_qty(row['total'], row['metric'])} "
+            f"• <b>{h(row['habit'])}</b> · {h(_qty(row['total'], row['metric']))} "
             f"on {days} day{'s' if days != 1 else ''}"
         )
         if row.get("streak_days", 0) >= 2:
             line += f" · 🔥 {row['streak_days']}"
         lines.append(line)
-    await update.message.reply_text("\n".join(lines))
+    await _reply(update.message, "\n".join(lines))
 
 
 async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"{settings.api_base_url}/internal/today")
-    except Exception:
-        log.exception("today call failed")
-        await update.message.reply_text(UNREACHABLE)
+    data = await _simple_get(update, "/internal/today")
+    if data is None:
         return
-    if r.status_code != 200:
-        await update.message.reply_text(_friendly_error(r))
-        return
-    logs = r.json()["logs"]
+    logs = data["logs"]
     if not logs:
         await update.message.reply_text(
             f"Nothing logged yet today. Send something like {EXAMPLES}."
@@ -328,18 +548,18 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for item in logs:
         key = (item["habit"], item["metric"])
         totals[key] = totals.get(key, 0) + item["amount"]
-    lines = ["📅 Today so far:"] + [
-        f"• {habit}: {_qty(amount, metric)}" for (habit, metric), amount in totals.items()
+    lines = ["📅 <b>Today so far</b>"] + [
+        f"• <b>{h(habit)}</b> · {h(_qty(amount, metric))}"
+        for (habit, metric), amount in totals.items()
     ]
-    await update.message.reply_text("\n".join(lines))
+    await _reply(update.message, "\n".join(lines))
 
 
 async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(f"{settings.api_base_url}/internal/undo", json={})
+        r = await _post("/internal/undo", {})
     except Exception:
         log.exception("undo call failed")
         await update.message.reply_text(UNREACHABLE)
@@ -350,223 +570,210 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if r.status_code != 200:
         await update.message.reply_text(_friendly_error(r))
         return
-    await update.message.reply_text(f"↩️ Undid your last log: {r.json()['preview']}.")
+    await _reply(update.message, f"↩️ <b>Undone</b>: {h(r.json()['preview'])}")
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
-    popped = [  # a list, not any(<generator>): every key must be popped
-        context.user_data.pop(key, None)
-        for key in ("awaiting_clarification", "awaiting_feedback_for", "feedback_card_message_id")
-    ]
-    had_question = any(value is not None for value in popped)
-    await update.message.reply_text(
-        "OK, cancelled." if had_question else "There's nothing to cancel."
-    )
+    chat_id = update.effective_chat.id
+    editing = await _drop_state(context, chat_id, EDIT)
+    unit = await _drop_state(context, chat_id, UNIT)
+    if unit:
+        await _discard_quietly(unit["audit_id"])
+    if editing or unit:
+        await update.message.reply_text("OK, cancelled.")
+    else:
+        await update.message.reply_text("There's nothing to cancel.")
 
 
-async def _send_card(update: Update, data: dict):
-    body = _card_text(data)
-    markup = _card_markup(data["audit_id"])
+async def _discard_quietly(audit_id: int):
     try:
-        await update.message.reply_text(body, reply_markup=markup, parse_mode="Markdown")
+        await _post("/internal/discard", {"audit_id": audit_id})
     except Exception:
-        await update.message.reply_text(f"📝 {data['preview']}", reply_markup=markup)
+        log.exception("discard failed")
 
 
-async def _send_habit_card(update: Update, audit_id: int, prompt: str):
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Create & log", callback_data=f"create_habit:{audit_id}"),
-                InlineKeyboardButton("❌ No thanks", callback_data=f"cancel_habit:{audit_id}"),
-            ]
-        ]
-    )
-    await update.message.reply_text(prompt, reply_markup=keyboard)
-
-
-async def _handle_draft_result(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    """Route a DraftResponse: ask for a unit, offer a new habit, or show the card."""
-    if data.get("needs_input") == "unit":
-        context.user_data["awaiting_clarification"] = {"audit_id": data["audit_id"]}
-        await update.message.reply_text(data["prompt"])
+# ------------------------------------------------------------------
+# Text messages
+# ------------------------------------------------------------------
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
         return
-    if data.get("needs_input") == "habit":
-        await _send_habit_card(update, data["audit_id"], data["prompt"])
-        return
-    await _send_card(update, data)
+    text = update.message.text or ""
+    chat_id = update.effective_chat.id
 
-
-async def _retire_card(update: Update, context: ContextTypes.DEFAULT_TYPE, message_id):
-    if not message_id:
+    editing = context.user_data.get(EDIT)
+    if editing and not _looks_like_question(text):
+        if _is_cancel(text):
+            await _drop_state(context, chat_id, EDIT)
+            await update.message.reply_text("OK, I left the draft as it was.")
+            return
+        await _send_feedback(update.message, context, chat_id, editing["audit_id"], text)
         return
-    try:
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id,
-            message_id=message_id,
-            text="✏️ Changed. See my next message.",
+
+    unit = context.user_data.get(UNIT)
+    if unit and not _looks_like_question(text):
+        if _is_cancel(text):
+            await _drop_state(context, chat_id, UNIT)
+            await _discard_quietly(unit["audit_id"])
+            await update.message.reply_text("OK, dropped it.")
+            return
+        await _typing(update, context)
+        outcome = await _send_unit(
+            update.message, context, chat_id, unit["audit_id"], text, typed=True
         )
-    except Exception:
-        log.warning("could not retire card %s", message_id)
+        if outcome == "new_log":
+            await _send_message(update, context)
+        return
 
-
-async def _send_feedback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, audit_id: int, feedback: str
-):
-    card_message_id = context.user_data.pop("feedback_card_message_id", None)
     await _typing(update, context)
-    try:
-        async with httpx.AsyncClient(timeout=settings.api_llm_timeout_seconds) as client:
-            r = await client.post(
-                f"{settings.api_base_url}/internal/feedback",
-                json={"audit_id": audit_id, "feedback": feedback},
-            )
-    except Exception:
-        log.exception("feedback call failed")
-        # Keep the edit open: resending the fix should retry it, not start a new draft.
-        context.user_data["awaiting_feedback_for"] = audit_id
-        if card_message_id:
-            context.user_data["feedback_card_message_id"] = card_message_id
-        await update.message.reply_text(f"{UNREACHABLE} Send your fix again, or “cancel”.")
-        return
+    await _send_message(update, context)
+    if editing or unit:
+        what = "your change" if editing else "the unit"
+        await update.message.reply_text(f"(I'm still waiting for {what} above, or send /cancel.)")
 
-    if r.status_code == 422:
-        # Keep the edit open so the next message is another try.
-        context.user_data["awaiting_feedback_for"] = audit_id
-        if card_message_id:
-            context.user_data["feedback_card_message_id"] = card_message_id
-        await update.message.reply_text(
-            "I couldn't apply that change. Try rephrasing, like “6 miles, not 4”, "
-            "or /cancel."
+
+async def _send_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str | None = None
+):
+    """POST /internal/message and show what comes back."""
+    try:
+        r = await _post(
+            "/internal/message",
+            {
+                "chat_id": update.effective_chat.id,
+                "text": text or update.message.text,
+                "message_id": update.message.message_id,
+            },
+            timeout=settings.api_llm_timeout_seconds,
         )
+    except Exception:
+        log.exception("message call failed")
+        await update.message.reply_text(UNREACHABLE)
         return
     if r.status_code >= 400:
         await update.message.reply_text(_friendly_error(r))
         return
 
     data = r.json()
-    if data.get("needs_input"):
-        # The old card's buttons no longer apply: the draft now needs an answer.
-        await _retire_card(update, context, card_message_id)
-        await _handle_draft_result(update, context, data)
-        return
-
-    # Regenerated: update the original card in place.
-    body = _card_text(data)
-    if card_message_id:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id,
-                message_id=card_message_id,
-                text=f"🔄 Updated\n\n{body}",
-                reply_markup=_card_markup(data["audit_id"]),
-                parse_mode="Markdown",
-            )
-            return
-        except Exception:
-            log.warning("could not edit card %s in place", card_message_id)
-    await _send_card(update, data)
+    kind = data.get("kind")
+    if kind == "log":
+        if context.user_data.get(UNIT) and data["draft"].get("needs_input") != "unit":
+            await _drop_state(context, update.effective_chat.id, UNIT)
+        await _show_draft(update.message, context, data["draft"])
+    elif kind == "answer":
+        text, markup = render_answer(data["answer"])
+        await _reply(update.message, text, markup)
+    elif kind == "chat":
+        await _reply(update.message, HELP_TEXT)
+    else:
+        await update.message.reply_text(data.get("text") or COULDNT_UNDERSTAND)
 
 
-async def _send_clarification(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, audit_id: int
+async def _send_unit(
+    message, context, chat_id: int, audit_id: int, value: str, typed: bool, query=None
 ):
-    await _typing(update, context)
+    """Answer a unit question (typed, or a unit button when query is set)."""
     try:
-        async with httpx.AsyncClient(timeout=settings.api_llm_timeout_seconds) as client:
-            r = await client.post(
-                f"{settings.api_base_url}/internal/clarify",
-                json={"audit_id": audit_id, "value": update.message.text},
-            )
+        r = await _post(
+            "/internal/clarify",
+            {"audit_id": audit_id, "value": value},
+            timeout=settings.api_llm_timeout_seconds,
+        )
     except Exception:
         log.exception("clarify call failed")
-        await update.message.reply_text(f"{UNREACHABLE} Reply again, or /cancel.")
+        await message.reply_text(f"{UNREACHABLE} Try again, or /cancel.")
         return
 
     detail = _detail(r)
     if r.status_code == 409 and isinstance(detail, dict) and detail.get("code") == "new_log":
-        # Not a unit but a new log ("read 20 pages"): drop the question, draft this.
-        context.user_data.pop("awaiting_clarification", None)
-        await update.message.reply_text(
-            f"OK, I dropped “{detail.get('dropped', 'the earlier one')}” (no unit) "
-            "and read this as a new log."
+        # Not a unit but a new log ("read 20 pages"): drop the question, log this instead.
+        await _drop_state(context, chat_id, UNIT)
+        await _reply(
+            message,
+            f"OK, I dropped “{h(detail.get('dropped', 'the earlier one'))}” "
+            "(no unit) and read this as a new log.",
         )
-        await _draft_new(update, context)
-        return
+        return "new_log"
     if r.status_code in (404, 409):
-        # The audit is gone or no longer waiting on us; stop routing here.
-        context.user_data.pop("awaiting_clarification", None)
-        await update.message.reply_text("That question has expired. Send your log again.")
+        await _drop_state(context, chat_id, UNIT)
+        await message.reply_text("That question has expired. Send your log again.")
         return
     if r.status_code >= 400:
-        await update.message.reply_text(f"{_friendly_error(r)} Reply again, or /cancel.")
+        await message.reply_text(f"{_friendly_error(r)} Try again, or /cancel.")
         return
 
     data = r.json()
-    if data.get("needs_input"):
-        await update.message.reply_text(data["prompt"])
+    if data.get("needs_input") == "unit":
+        text, markup = render_unit_question(data)
+        if query:
+            await _edit(query, text, markup)
+        else:
+            await _drop_state(context, chat_id, UNIT)
+            await _show_draft(message, context, data)
         return
-    context.user_data.pop("awaiting_clarification", None)
-    await _send_card(update, data)
+    if typed:
+        await _drop_state(context, chat_id, UNIT)  # the question's buttons no longer apply
+    else:
+        context.user_data.pop(UNIT, None)  # the question message itself becomes the card
+    text, markup = render_card(data)
+    if query:
+        await _edit(query, text, markup)
+    else:
+        await _reply(message, text, markup)
 
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update):
-        return
-
-    pending_feedback = context.user_data.pop("awaiting_feedback_for", None)
-    if pending_feedback is not None:
-        if _is_cancel(update.message.text):
-            context.user_data.pop("feedback_card_message_id", None)
-            await update.message.reply_text("OK, I left the draft as it was.")
-            return
-        await _send_feedback(update, context, pending_feedback, update.message.text)
-        return
-
-    awaiting = context.user_data.get("awaiting_clarification")
-    if awaiting is not None:
-        if _is_cancel(update.message.text):
-            context.user_data.pop("awaiting_clarification", None)
-            try:
-                await _post("/internal/discard", {"audit_id": awaiting["audit_id"]})
-            except Exception:
-                log.exception("discard after cancel failed")
-            await update.message.reply_text("OK, dropped it.")
-            return
-        await _send_clarification(update, context, awaiting["audit_id"])
-        return
-
-    await _draft_new(update, context)
-
-
-async def _draft_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _typing(update, context)
+async def _send_feedback(message, context, chat_id: int, audit_id: int, feedback: str):
+    """Apply a correction; the old card is retired and the new one sent below."""
+    editing = context.user_data.get(EDIT) or {}
     try:
-        async with httpx.AsyncClient(timeout=settings.api_llm_timeout_seconds) as client:
-            r = await client.post(
-                f"{settings.api_base_url}/internal/draft",
-                json={
-                    "chat_id": update.effective_chat.id,
-                    "text": update.message.text,
-                    "message_id": update.message.message_id,
-                },
-            )
+        r = await _post(
+            "/internal/feedback",
+            {"audit_id": audit_id, "feedback": feedback},
+            timeout=settings.api_llm_timeout_seconds,
+        )
     except Exception:
-        log.exception("draft call failed")
-        await update.message.reply_text(UNREACHABLE)
+        log.exception("feedback call failed")
+        await message.reply_text(f"{UNREACHABLE} Send your fix again, or “cancel”.")
+        return  # the change stays open: resending retries it
+    if r.status_code == 422:
+        await message.reply_text(
+            "I couldn't apply that change. Try rephrasing, like “6 miles, not 4”, or /cancel."
+        )
         return
-
+    await _drop_state(context, chat_id, EDIT)
     if r.status_code >= 400:
-        await update.message.reply_text(_friendly_error(r))
+        await message.reply_text(_friendly_error(r))
         return
-    await _handle_draft_result(update, context, r.json())
+
+    card_id = editing.get("card_message_id")
+    if card_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=card_id,
+                text=f"✏️ Changed: “{feedback}”. See the updated draft below.",
+            )
+        except Exception:
+            log.warning("could not retire card %s", card_id)
+    data = r.json()
+    if data.get("needs_input"):
+        await _show_draft(message, context, data)
+        return
+    text, markup = render_card(data, header="🔄 <b>Updated. Log this?</b>")
+    await _reply(message, text, markup)
 
 
-async def _post(path: str, payload: dict, timeout: float = 30) -> httpx.Response:
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        return await client.post(f"{settings.api_base_url}{path}", json=payload)
+# ------------------------------------------------------------------
+# Buttons
+# ------------------------------------------------------------------
+def _parse_callback(data: str) -> tuple[str, int, str | None]:
+    parts = (data or "").split(":", 2)
+    if len(parts) < 2:
+        raise ValueError(data)
+    action = LEGACY_ACTIONS.get(parts[0], parts[0])
+    return action, int(parts[1]), parts[2] if len(parts) == 3 else None
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -576,230 +783,219 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != settings.telegram_allowed_user_id:
         await query.answer()
         return
-
     try:
-        action, id_str = query.data.split(":", 1)
-        target_id = int(id_str)
+        action, target_id, extra = _parse_callback(query.data)
     except Exception:
         await query.answer()
-        await query.edit_message_text("Malformed button.")
+        await query.edit_message_text("That button is no longer valid.")
         return
 
-    # Acting on a card closes any edit that was open for it.
-    editing = context.user_data.get("awaiting_feedback_for")
-    if action in ("approve", "discard") and editing == target_id:
-        context.user_data.pop("awaiting_feedback_for", None)
-        context.user_data.pop("feedback_card_message_id", None)
-
-    if action == "feedback":
+    handler = BUTTONS.get(action)
+    if handler is None:
         await query.answer()
-        context.user_data["awaiting_feedback_for"] = target_id
-        context.user_data["feedback_card_message_id"] = query.message.message_id
-        await query.edit_message_text(
-            f"{query.message.text}\n\n"
-            "✏️ What should change? Reply with the fix, like “6 miles, not 4” "
-            "or “it was yesterday”. Reply “cancel” to keep it as is.",
-            reply_markup=_card_markup(target_id),
-        )
+        await query.edit_message_text("That button is no longer valid.")
         return
+    await handler(update, context, query, target_id, extra)
 
-    endpoints = {
-        "approve": ("/internal/execute", {"audit_id": target_id}),
-        "discard": ("/internal/discard", {"audit_id": target_id}),
-        "undo": ("/internal/undo", {"log_id": target_id}),
-        "undo_audit": ("/internal/undo", {"audit_id": target_id}),
-        "create_habit": ("/internal/approve_habit", {"audit_id": target_id, "accept": True}),
-        "cancel_habit": ("/internal/approve_habit", {"audit_id": target_id, "accept": False}),
+
+async def _api_or_popup(query, path: str, payload: dict, timeout: float = 30):
+    """POST and return the JSON, or show the problem in a popup and return None."""
+    try:
+        r = await _post(path, payload, timeout=timeout)
+    except Exception:
+        log.exception("%s failed", path)
+        await query.answer(UNREACHABLE, show_alert=True)
+        return None
+    if r.status_code >= 400:
+        await query.answer(_friendly_error(r), show_alert=True)  # leave the message alone
+        return None
+    await query.answer()
+    return r.json()
+
+
+async def _close_edit_for(context, chat_id: int, audit_id: int):
+    editing = context.user_data.get(EDIT)
+    if editing and editing["audit_id"] == audit_id:
+        await _drop_state(context, chat_id, EDIT)
+
+
+async def on_save(update, context, query, audit_id, extra):
+    await _close_edit_for(context, update.effective_chat.id, audit_id)
+    data = await _api_or_popup(query, "/internal/execute", {"audit_id": audit_id})
+    if data is None:
+        return
+    if data.get("status") == "already_executed":
+        await _edit(query, "✅ Already saved.")
+        return
+    text, markup = render_saved({**data, "audit_id": audit_id})
+    await _edit(query, text, markup)
+
+
+async def on_cancel(update, context, query, audit_id, extra):
+    chat_id = update.effective_chat.id
+    await _close_edit_for(context, chat_id, audit_id)
+    unit = context.user_data.get(UNIT)
+    if unit and unit["audit_id"] == audit_id:
+        context.user_data.pop(UNIT, None)
+    data = await _api_or_popup(query, "/internal/discard", {"audit_id": audit_id})
+    if data is not None:
+        await _edit(query, "✖ Cancelled. Nothing was saved.")
+
+
+async def on_change(update, context, query, audit_id, extra):
+    await query.answer()
+    chat_id = update.effective_chat.id
+    await _drop_state(context, chat_id, EDIT)  # one change at a time
+    text, markup = render_change_prompt(audit_id, getattr(query.message, "text", "") or "")
+    sent = await _reply(query.message, text, markup)
+    context.user_data[EDIT] = {
+        "audit_id": audit_id,
+        "card_message_id": query.message.message_id,
+        "prompt_message_id": getattr(sent, "message_id", None),
     }
-    if action not in endpoints:
-        await query.answer()
-        await query.edit_message_text("Malformed button.")
-        return
 
-    path, payload = endpoints[action]
+
+async def on_fix(update, context, query, audit_id, extra):
+    feedback = QUICK_FIXES.get(extra or "")
+    if feedback is None:
+        await query.answer()
+        return
+    await query.answer()
+    editing = context.user_data.get(EDIT) or {}
+    if editing.get("audit_id") != audit_id:  # an old prompt: still apply it
+        context.user_data[EDIT] = {
+            "audit_id": audit_id,
+            "card_message_id": None,
+            "prompt_message_id": query.message.message_id,
+        }
+    await _edit(query, f"✏️ {h(feedback.capitalize())}…")
+    context.user_data[EDIT]["prompt_message_id"] = None  # already edited
+    await _send_feedback(query.message, context, update.effective_chat.id, audit_id, feedback)
+
+
+async def on_keep(update, context, query, audit_id, extra):
+    await query.answer()
+    await _close_edit_for(context, update.effective_chat.id, audit_id)
+    await _edit(query, "OK, I left the draft as it was.")
+
+
+async def on_unit(update, context, query, audit_id, extra):
+    if not extra:
+        await query.answer()
+        return
+    await query.answer()
+    await _send_unit(
+        query.message, context, update.effective_chat.id, audit_id, extra, typed=False, query=query
+    )
+
+
+async def on_create(update, context, query, audit_id, extra):
+    data = await _api_or_popup(
+        query, "/internal/approve_habit", {"audit_id": audit_id, "accept": True}
+    )
+    if data is None:
+        return
+    if data.get("needs_input") == "unit":
+        text, markup = render_unit_question(data)
+        await _edit(query, text, markup)
+        context.user_data[UNIT] = {"audit_id": audit_id, "message_id": query.message.message_id}
+        return
+    text, markup = render_card(data, header="✨ <b>New habit created. Log this?</b>")
+    await _edit(query, text, markup)
+
+
+async def on_nocreate(update, context, query, audit_id, extra):
+    data = await _api_or_popup(
+        query, "/internal/approve_habit", {"audit_id": audit_id, "accept": False}
+    )
+    if data is not None:
+        await _edit(query, "OK, I didn't create it.")
+
+
+async def _undo(query, payload: dict):
+    data = await _api_or_popup(query, "/internal/undo", payload)
+    if data is None:
+        return
+    word = "Already undone" if data.get("status") == "already_undone" else "Undone"
+    await _edit(query, f"↩️ <b>{word}</b>: {h(data['preview'])}")
+
+
+async def on_undo(update, context, query, log_id, extra):
+    await _undo(query, {"log_id": log_id})
+
+
+async def on_undo_audit(update, context, query, audit_id, extra):
+    await _undo(query, {"audit_id": audit_id})
+
+
+async def on_draft_sql(update, context, query, audit_id, extra):
     try:
-        r = await _post(path, payload)
+        r = await _get(f"/internal/drafts/{audit_id}")
     except Exception:
-        log.exception("%s call failed", action)
         await query.answer(UNREACHABLE, show_alert=True)
         return
-
-    if r.status_code >= 400:
-        # Leave the card alone; show why in a popup.
+    if r.status_code != 200:
         await query.answer(_friendly_error(r), show_alert=True)
+        return
+    data = r.json()
+    sql = data.get("final_sql") or data.get("draft_sql")
+    if not sql:
+        await query.answer("No SQL for this one.", show_alert=True)
+        return
+    await query.answer()
+    await _reply(query.message, render_sql("SQL for this log", sql))
+    if data.get("status") == "pending":
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=card_markup(audit_id, sql_button=False)
+            )
+        except Exception:
+            pass
+
+
+async def on_query_sql(update, context, query, query_id, extra):
+    try:
+        r = await _get(f"/internal/queries/{query_id}")
+    except Exception:
+        await query.answer(UNREACHABLE, show_alert=True)
+        return
+    if r.status_code != 200 or not r.json().get("sql"):
+        await query.answer("I don't have the SQL for that anymore.", show_alert=True)
         return
     await query.answer()
     data = r.json()
+    title = "SQL used" + (" (built-in template)" if data.get("source") == "template" else "")
+    await _reply(query.message, render_sql(title, data["sql"]))
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
-    if action == "approve":
-        if data.get("status") == "already_executed":
-            await query.edit_message_text("✅ Already logged.")
-            return
-        several = len(data.get("log_ids") or []) > 1
-        undo = f"undo_audit:{target_id}" if several else f"undo:{data['log_id']}"
-        await query.edit_message_text(_format_executed(data), reply_markup=_undo_markup(undo))
-    elif action == "discard":
-        await query.edit_message_text("🗑️ Discarded.")
-    elif action in ("undo", "undo_audit"):
-        if data.get("status") == "already_undone":
-            await query.edit_message_text(f"↩️ Already undone: {data['preview']}.")
-        else:
-            await query.edit_message_text(f"↩️ Undone: {data['preview']}.")
-    elif action == "create_habit":
-        if data.get("needs_input") == "unit":
-            context.user_data["awaiting_clarification"] = {"audit_id": target_id}
-            await query.edit_message_text(data["prompt"])
-            return
-        body = _card_text(data)
-        try:
-            await query.edit_message_text(
-                f"✨ New habit created.\n\n{body}",
-                reply_markup=_card_markup(target_id),
-                parse_mode="Markdown",
-            )
-        except Exception:
-            await query.edit_message_text(
-                f"✨ New habit created.\n\n📝 {data['preview']}",
-                reply_markup=_card_markup(target_id),
-            )
-    elif action == "cancel_habit":
-        await query.edit_message_text("OK, I didn't create it.")
+
+BUTTONS = {
+    "save": on_save,
+    "cancel": on_cancel,
+    "change": on_change,
+    "fix": on_fix,
+    "keep": on_keep,
+    "unit": on_unit,
+    "create": on_create,
+    "nocreate": on_nocreate,
+    "undo": on_undo,
+    "undo_audit": on_undo_audit,
+    "sql": on_draft_sql,
+    "qsql": on_query_sql,
+}
 
 
 # ------------------------------------------------------------------
-# Reminders
+# Main
 # ------------------------------------------------------------------
-def _job_name(chat_id: int) -> str:
-    return f"reminder:{chat_id}"
-
-
-def unschedule_reminder(job_queue, chat_id: int):
-    for job in job_queue.get_jobs_by_name(_job_name(chat_id)):
-        job.schedule_removal()
-
-
-def schedule_reminder(job_queue, chat_id: int, remind_at: str):
-    """(Re)schedule the daily check-in at "HH:MM" in the app timezone."""
-    unschedule_reminder(job_queue, chat_id)
-    hour, minute = (int(x) for x in remind_at.split(":"))
-    job_queue.run_daily(
-        send_reminder,
-        time=dtime(hour, minute, tzinfo=ZoneInfo(settings.app_timezone)),
-        chat_id=chat_id,
-        name=_job_name(chat_id),
-    )
-
-
-async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = context.job.chat_id
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                f"{settings.api_base_url}/internal/reminders/check", params={"chat_id": chat_id}
-            )
-        r.raise_for_status()
-    except Exception:
-        log.exception("reminder check failed")
-        return  # a missed nudge is better than an error message at 9pm
-    text = format_reminder(r.json())
-    if text:
-        await context.bot.send_message(chat_id=chat_id, text=text)
-
-
-async def _put_reminder(payload: dict) -> httpx.Response:
-    async with httpx.AsyncClient(timeout=10) as client:
-        return await client.put(f"{settings.api_base_url}/internal/reminders", json=payload)
-
-
-async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update):
-        return
-    chat_id = update.effective_chat.id
-    arg = " ".join(context.args or []).strip().lower()
-    job_queue = context.job_queue
-    try:
-        if not arg:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(f"{settings.api_base_url}/internal/reminders")
-            mine = next((x for x in r.json() if x["chat_id"] == chat_id), None)
-            if mine and mine["enabled"]:
-                await update.message.reply_text(
-                    f"⏰ Reminders are on at {mine['remind_at']}. "
-                    "/remind 20:30 changes the time, /remind off stops them."
-                )
-            else:
-                await update.message.reply_text(
-                    "Reminders are off. Try /remind 21:00 or /remind 9pm "
-                    "for a daily evening check-in."
-                )
-            return
-        if arg in ("off", "stop", "no", "disable"):
-            await _put_reminder({"chat_id": chat_id, "remind_at": None, "enabled": False})
-            if job_queue:
-                unschedule_reminder(job_queue, chat_id)
-            await update.message.reply_text("🔕 Reminders are off.")
-            return
-        r = await _put_reminder({"chat_id": chat_id, "remind_at": arg, "enabled": True})
-    except Exception:
-        log.exception("reminder settings call failed")
-        await update.message.reply_text(UNREACHABLE)
-        return
-    if r.status_code == 422:
-        await update.message.reply_text(
-            "I didn't understand that time. Try /remind 21:00 or /remind 9pm."
-        )
-        return
-    if r.status_code != 200:
-        await update.message.reply_text(_friendly_error(r))
-        return
-    remind_at = r.json()["remind_at"]
-    if job_queue:
-        schedule_reminder(job_queue, chat_id, remind_at)
-    await update.message.reply_text(
-        f"⏰ Done. I'll check in every day at {remind_at} ({settings.app_timezone}), "
-        "but only if something still needs logging."
-    )
-
-
-REMINDER_RETRY_SECONDS = 30
-
-
-async def load_reminders(job_queue) -> bool:
-    """Schedule every enabled reminder stored in the API. False if unreachable."""
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(f"{settings.api_base_url}/internal/reminders")
-        r.raise_for_status()
-        reminders = r.json()
-    except Exception as e:
-        log.warning("could not load reminders (retrying in %ss): %s", REMINDER_RETRY_SECONDS, e)
-        return False
-    for item in reminders:
-        if item["enabled"]:
-            schedule_reminder(job_queue, item["chat_id"], item["remind_at"])
-            log.info("reminder scheduled for %s at %s", item["chat_id"], item["remind_at"])
-    return True
-
-
-async def _retry_load_reminders(context: ContextTypes.DEFAULT_TYPE):
-    if not await load_reminders(context.job_queue):
-        context.job_queue.run_once(
-            _retry_load_reminders, REMINDER_RETRY_SECONDS, name="reminder-sync"
-        )
-
-
 async def on_startup(app: Application):
     try:
         await app.bot.set_my_commands([BotCommand(n, d) for n, d in COMMANDS])
     except Exception as e:
         log.warning("could not set command menu: %s", e)
-    if app.job_queue is None:
-        log.warning("job queue unavailable; install python-telegram-bot[job-queue]")
-        return
-    # The API may still be starting (no startup ordering on some hosts):
-    # keep trying in the background instead of silently scheduling nothing.
-    if not await load_reminders(app.job_queue):
-        app.job_queue.run_once(_retry_load_reminders, REMINDER_RETRY_SECONDS, name="reminder-sync")
 
 
 def main():
@@ -808,14 +1004,12 @@ def main():
         raise SystemExit("TELEGRAM_BOT_TOKEN is not set")
 
     app = Application.builder().token(token).post_init(on_startup).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("habits", habits_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("today", today_cmd))
     app.add_handler(CommandHandler("undo", undo_cmd))
-    app.add_handler(CommandHandler("remind", remind_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

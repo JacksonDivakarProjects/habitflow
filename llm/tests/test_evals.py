@@ -139,3 +139,71 @@ def test_case_file_covers_unit_decisions(data):
     names = {c["name"] for c in data["cases"]}
     assert {"m is meters for a run", "m is minutes for meditation", "no conversion",
             "new habit gets natural unit"} <= names
+
+
+# ------------------------------------------------------------------
+# Question evals (evals/questions.py)
+# ------------------------------------------------------------------
+from evals import questions as qevals  # noqa: E402
+
+
+def test_question_case_file_is_well_formed():
+    data = qevals.load_cases()
+    assert {c["kind"] for c in data["classify"]} == {"log", "query", "chat"}
+    names = [c["name"] for c in data["query"]]
+    assert len(names) == len(set(names))
+    anchors = qevals.anchors(REF)
+    for case in data["query"]:
+        assert case["question"]
+        assert case.get("refuse") or case.get("must"), case["name"]
+        if "period" in case:
+            assert case["period"] in anchors, case["name"]
+
+
+def test_question_anchors_match_the_api():
+    a = qevals.anchors(date(2026, 9, 24))
+    assert (a["this_week_start"], a["last_week_start"], a["last_week_end"]) == (
+        "2026-09-21", "2026-09-14", "2026-09-20")
+    assert (a["this_month_start"], a["last_month_start"]) == ("2026-09-01", "2026-08-01")
+
+
+def test_query_scorer():
+    dates = qevals.anchors(REF)
+    case = {"name": "x", "must": ["habit = 'work'"], "period": "this_month_start"}
+    good = {"sql": f"SELECT sum(amount) FROM habit_logs WHERE habit='work' AND "
+                   f"log_date >= DATE '{dates['this_month_start']}'"}
+    assert qevals.score_query({**case, "must": ["habit='work'"]}, good, dates) == []
+    bad = {"sql": "SELECT * FROM daily_logs WHERE log_date >= CURRENT_DATE"}
+    problems = qevals.score_query(case, bad, dates)
+    assert "missing: habit = 'work'" in problems
+    assert "forbidden: current_date" in problems and "forbidden: daily_logs" in problems
+    assert any(p.startswith("period:") for p in problems)
+    assert qevals.score_query({"refuse": True}, {"sql": None}, dates) == []
+    assert qevals.score_query({"refuse": True}, {"sql": "SELECT 1"}, dates)
+    assert qevals.score_query(case, {"sql": None, "note": "no"}, dates) == ["no SQL (note: 'no')"]
+
+
+def test_query_scorer_uses_the_guard():
+    guard = lambda sql: ("only SELECT", "")  # noqa: E731
+    problems = qevals.score_query({"must": []}, {"sql": "SELECT 1"}, qevals.anchors(REF), guard)
+    assert problems == ["guard: only SELECT"]
+
+
+def test_question_run_cases_with_a_fake_model():
+    data = qevals.load_cases()
+    results = qevals.run_cases(
+        classify=lambda text, habits: {"kind": "query"},
+        query_sql=lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")),
+        data=data, ref=REF)
+    by_name = {r["name"]: r for r in results}
+    assert by_name["classify: read today"]["passed"]
+    assert not by_name["classify: tell me a joke"]["passed"]
+    assert by_name["query: reading pattern"]["problems"] == ["error: boom"]
+
+
+def test_api_guard_loads_next_to_llm_app():
+    pytest.importorskip("sqlglot")
+    guard = qevals._api_guard()
+    assert guard is not None
+    assert guard("SELECT * FROM daily_logs")[0]
+    assert guard("SELECT count(*) FROM habit_logs")[0] is None

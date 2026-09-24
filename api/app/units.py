@@ -92,3 +92,12 @@ def convert(amount: float, from_unit: str, to_unit: str) -> Optional[float]:
         return None
     factors = _FAMILIES[family]
     return float(amount) * factors[src] / factors[dst]
+
+
+def family_units(unit: Optional[str]) -> list[str]:
+    """unit first, then the others it converts to: 'miles' -> miles, km, meters."""
+    c = canonical(unit)
+    family = _FAMILY_OF.get(c)
+    if family is None:
+        return [c] if c else []
+    return [c] + [u for u in _FAMILIES[family] if u != c]

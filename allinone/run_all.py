@@ -7,7 +7,7 @@ Processes, started in this order and stopped in reverse:
             on a unix socket only, never on the network.
   llm       uvicorn on 127.0.0.1:9000
   api       uvicorn on 127.0.0.1:8000 (applies migrations at startup)
-  bot       Telegram polling + reminder jobs
+  bot       Telegram polling
 
 Each start waits for the previous service's health check, so nothing starts
 before what it depends on. Any process that exits is restarted with
@@ -24,7 +24,7 @@ Web-service mode (Render free web services, anything that sets $PORT):
     HTTP traffic, and the bot's Telegram polling is outbound. Every
     KEEP_AWAKE_MINUTES (10) the container requests its own public URL
     (RENDER_EXTERNAL_URL, or KEEP_AWAKE_URL) so it stays awake and the bot
-    and reminders keep running. KEEP_AWAKE=0 turns it off.
+    keeps answering. KEEP_AWAKE=0 turns it off.
 """
 
 import json

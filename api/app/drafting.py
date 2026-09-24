@@ -13,11 +13,10 @@ import re
 from datetime import date
 from typing import Optional
 
-import httpx
 from sqlalchemy import select, text, update
 from sqlalchemy.orm import Session
 
-from app.config import settings
+from app import llm_client
 from app.models import AuditLog, Habit
 from app.parser import parse_correction, parse_text
 from app.sqlguard import bind_nulls, check_draft_sql
@@ -74,13 +73,7 @@ def llm_view(intent: Optional[dict]) -> Optional[dict]:
 
 
 def call_llm(**kwargs) -> dict:
-    r = httpx.post(
-        f"{settings.llm_base_url}/extract",
-        json=kwargs,
-        timeout=settings.llm_timeout_seconds,
-    )
-    r.raise_for_status()
-    return r.json()["intent"]
+    return llm_client.post("/extract", kwargs)["intent"]
 
 
 def template_sql(habit_names: list[str]) -> str:

@@ -7,7 +7,9 @@ TEST_DATABASE_URL if set (e.g. the compose db), otherwise an embedded Postgres
 via `pgserver`. The real database is never touched.
 
 LLM: `app.drafting.call_llm` is replaced by FakeLLM, which returns queued
-responses so every flow is deterministic.
+responses so every flow is deterministic. Every other LLM call
+(app.llm_client.post: /classify, /query_sql, /answer) is offline by default;
+the `llm_http` fixture scripts replies per path.
 """
 
 import copy
@@ -74,7 +76,7 @@ def clean_db(migrated):
     seed = SEED_SQL.read_text()
     with engine.begin() as conn:
         conn.exec_driver_sql(
-            "TRUNCATE daily_logs, audit_log, habits, reminder_settings RESTART IDENTITY CASCADE"
+            "TRUNCATE daily_logs, audit_log, query_log, habits RESTART IDENTITY CASCADE"
         )
         conn.exec_driver_sql(seed)
     yield
@@ -158,3 +160,43 @@ def make_intent():
         return intent
 
     return _make
+
+
+class FakeLLMHTTP:
+    """Stands in for app.llm_client.post. Replies are queued per path; a path
+    with nothing queued behaves as if the LLM service were down."""
+
+    def __init__(self):
+        self.replies: dict[str, list] = {}
+        self.calls: list[tuple[str, dict]] = []
+
+    def queue(self, path: str, *replies):
+        self.replies.setdefault(path, []).extend(replies)
+
+    def paths(self) -> list[str]:
+        return [p for p, _ in self.calls]
+
+    def payloads(self, path: str) -> list[dict]:
+        return [body for p, body in self.calls if p == path]
+
+    def __call__(self, path: str, payload: dict) -> dict:
+        from app.llm_client import LLMUnavailable
+
+        self.calls.append((path, copy.deepcopy(payload)))
+        queued = self.replies.get(path)
+        if not queued:
+            raise LLMUnavailable(f"{path}: offline (test)")
+        r = queued.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return copy.deepcopy(r)
+
+
+@pytest.fixture(autouse=True)
+def llm_http(monkeypatch):
+    """No test ever reaches a real LLM service."""
+    from app import llm_client
+
+    fake = FakeLLMHTTP()
+    monkeypatch.setattr(llm_client, "post", fake)
+    return fake

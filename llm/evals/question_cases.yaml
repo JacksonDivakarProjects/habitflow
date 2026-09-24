@@ -1,0 +1,69 @@
+# Eval set for questions: routing (classify) and text-to-SQL (query_sql).
+# Run against the real model with:  cd llm && python -m evals.questions
+#
+# classify cases: text -> expected kind. Only unclear messages reach the LLM
+# in production (the API's rules take the clear ones), so these are hard ones.
+#
+# query cases:
+#   must        substrings the SQL must contain (case/whitespace-insensitive)
+#   must_not    substrings it must not contain (always: current_date, now(), daily_logs)
+#   period      a date anchor the SQL must use: this_month_start, last_week_start, ...
+#   refuse      true when the model should refuse (sql: null with a note)
+
+habits:
+  - {name: running, display_name: Running, default_metric: miles}
+  - {name: reading, display_name: Reading, default_metric: pages}
+  - {name: learning_sql, display_name: Learning SQL, default_metric: hours}
+  - {name: meditation, display_name: Meditation, default_metric: minutes}
+  - {name: work, display_name: Work, default_metric: hours}
+
+classify:
+  - {text: "read today", kind: query}
+  - {text: "reading lately", kind: query}
+  - {text: "sql last week", kind: query}
+  - {text: "running this morning, four miles", kind: log}
+  - {text: "meditated before bed", kind: log}
+  - {text: "pushups twenty", kind: log}
+  - {text: "worked all day on the report", kind: log}
+  - {text: "am I improving", kind: query}
+  - {text: "tell me a joke", kind: chat}
+  - {text: "you're great", kind: chat}
+
+query:
+  - name: reading pattern
+    question: "what is my reading pattern"
+    must: ["habit_logs", "habit = 'reading'", "weekday"]
+  - name: hours worked this month
+    question: "how many hours i worked this month"
+    must: ["habit = 'work'", "sum("]
+    period: this_month_start
+  - name: weekly work
+    question: "how many hours did I work each week this month"
+    must: ["habit = 'work'", "week_start", "group by"]
+    period: this_month_start
+  - name: most frequent habit last week
+    question: "which habit did I do most often last week"
+    must: ["count(", "order by"]
+    period: last_week_start
+  - name: running streak
+    question: "what's my longest running streak"
+    must: ["habit = 'running'", "row_number"]
+  - name: skipped meditation
+    question: "which days this week did I skip meditation"
+    must: ["generate_series", "habit = 'meditation'"]
+    period: this_week_start
+  - name: minutes as hours
+    question: "how many hours have I meditated in the last 30 days"
+    must: ["habit = 'meditation'", "/ 60"]
+    period: last_30_days_start
+  - name: compare two habits
+    question: "compare my reading and running this month"
+    must: ["'reading'", "'running'"]
+    period: this_month_start
+  - name: average per day
+    question: "average pages per day this month"
+    must: ["habit = 'reading'"]
+    period: this_month_start
+  - name: out of scope
+    question: "what's the weather tomorrow"
+    refuse: true

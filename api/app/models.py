@@ -1,4 +1,4 @@
-from datetime import date, datetime, time
+from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
@@ -12,7 +12,6 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
-    Time,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -83,13 +82,22 @@ class AuditLog(Base):
     )
 
 
-class ReminderSetting(Base):
-    __tablename__ = "reminder_settings"  # api/migrations/0002
+class QueryLog(Base):
+    """Every question asked, with the SQL used (migration 0004)."""
 
-    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    remind_at: Mapped[time] = mapped_column(Time, nullable=False)
-    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("TRUE"))
-    updated_at: Mapped[datetime] = mapped_column(
+    __tablename__ = "query_log"
+
+    query_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    sql: Mapped[str | None] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(20), nullable=False)
+    row_count: Mapped[int | None] = mapped_column(Integer)
+    answer: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("NOW()")
     )
 

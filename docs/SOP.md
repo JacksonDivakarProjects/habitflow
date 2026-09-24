@@ -5,7 +5,7 @@ For how it works internally, see the [README](../README.md).
 
 - [1. One-time setup](#1-one-time-setup)
 - [2. Daily use](#2-daily-use)
-- [3. Reminders and time](#3-reminders-and-time)
+- [3. Asking about your routine](#3-asking-about-your-routine)
 - [4. Operations](#4-operations)
 - [5. Making changes](#5-making-changes)
 - [6. Troubleshooting](#6-troubleshooting)
@@ -39,7 +39,7 @@ TELEGRAM_ALLOWED_USER_ID=<your numeric id>
 GROQ_API_KEY=<from Groq>
 GROQ_MODEL_NAME=llama-3.3-70b-versatile
 
-# APP_TIMEZONE=Asia/Kolkata   # see section 3
+# APP_TIMEZONE=Asia/Kolkata   # what "today" and "this week" mean
 ```
 
 Rules:
@@ -66,40 +66,56 @@ Then send `/start` to your bot in Telegram. If it doesn't answer, see
 
 ## 2. Daily use
 
+Send the bot a plain message. It works out whether you are **logging**
+something, **asking** about your routine, or just saying hi, and answers
+accordingly. You never need a command to log or ask.
+
 ### Logging
 
-| You send | What happens | What you do |
+| You send | What you get | What you do |
 |---|---|---|
-| `ran 4 miles` | Draft card: 📝 4 miles of Running today | ✅ Approve, ✏️ Edit or 🗑️ Discard |
-| `read 20` | Uses the habit's default unit, marked *(suggested unit)* | Approve, or Edit it |
-| `ran 3 miles and read 20 pages` | One card, one line per log | One Approve saves them all |
-| `did 20 pushups` (a new habit) | "“Pushups” is a new habit. Create it?" | ✅ Create & log, or ❌ No thanks |
-| A habit with no default unit | "What unit? (e.g. …)" | Reply `reps`, `km`, …, or `cancel` |
-| `read 30 pages yesterday`, `ran 5k 2 days ago` | Draft dated back | Approve |
+| `ran 4 miles` | 📝 **Log this?** • Running · 4 miles · today | ✅ Save, ✏️ Change or ✖ Cancel |
+| `read 20` | Uses the habit's default unit, with "Unit guessed from your habit" | Save, or Change it |
+| `ran 3 miles and read 20 pages` | One card, one line per log | One Save stores them all |
+| `did 20 pushups` (a new habit) | ✨ "“Pushups” is a new habit. Create it?" | ✨ Create habit, or ✖ No |
+| `ran 4` (no unit, and none can be guessed) | ❓ "What unit?" with buttons: miles · km · meters … | Tap a unit or type one; `cancel` drops it |
+| `read 30 pages yesterday`, `ran 5k 2 days ago` | A card dated back | Save |
 
-Nothing is saved until you tap **✅ Approve**.
+Nothing is saved until you tap **✅ Save**. **🔍 SQL** on a card shows the
+exact statement that will run.
 
-### After approving
+### After saving
 
-The card becomes `✅ Logged 4 miles of Running today` with a line such as
-`🔥 3-day streak · 12 miles this week`, and a **↩️ Undo** button. Undo
-removes every log from that card. Undone logs are kept in the audit trail
-but excluded from stats, streaks and `/today`.
+The card becomes:
 
-### Correcting a draft (✏️ Edit)
+```
+✅ Saved
+• Running · 4 miles · today
+   🔥 3-day streak · 12 miles this week
+```
 
-Tap **✏️ Edit**, then reply with the fix in plain words:
+with a **↩️ Undo** button. Undo removes every log from that card. Undone logs
+are kept in the audit trail but excluded from everything else: stats,
+streaks, `/today` and answers to questions.
+
+### Changing a draft (✏️ Change)
+
+Tap **✏️ Change**. The bot asks "What should change?" and offers one-tap
+fixes: **📅 It was yesterday**, **📅 It was today**, **↩️ Keep as is**. Or type
+the fix in plain words:
 
 - `6 miles, not 4`
-- `it was yesterday`
 - `km not miles`
 - `wrong habit, it was reading`
 - `also read 10 pages`
 
-The card updates in place (🔄 Updated). If the fix can't be applied, the
-draft stays exactly as it was: you can try again, approve it anyway, or
-reply `cancel`. If the fix turns the draft into a question (a new habit, a
-missing unit), the old card says "✏️ Changed. See my next message."
+The old card is marked "✏️ Changed" and the updated one arrives below
+(🔄 **Updated. Log this?**), so the latest card is always at the bottom of the
+chat. If the fix can't be applied, the change stays open: try again, tap
+Keep as is, or reply `cancel`.
+
+Asking a question while a change or a unit question is open is fine: the
+bot answers it and reminds you what it's still waiting for.
 
 ### Commands
 
@@ -109,112 +125,89 @@ missing unit), the old card says "✏️ Changed. See my next message."
 | `/stats` | 30-day totals and streaks. Compatible units are combined (km + miles, minutes + hours) |
 | `/undo` | Undo your most recent log |
 | `/habits` | Your habits and their default units |
-| `/remind 21:00`, `/remind 9pm`, `/remind off`, `/remind` | Daily check-in (see [section 3](#3-reminders-and-time)) |
-| `/cancel`, or reply `cancel` / `never mind` | Drop an open question or edit |
+| `/cancel`, or reply `cancel` / `never mind` | Drop an open question or change |
 | `/help` | The in-bot version of this section |
 
 ### Signals on a card
 
-- **⚡ AI is offline**: Groq couldn't be reached, so the simple parser read
-  your message. Check the card before approving.
+- **⚡ The AI is offline**: Groq couldn't be reached, so the simple parser read
+  your message. Check the card before saving.
 - **⚠️ Not included: …**: part of the message couldn't be logged together
   (usually a brand-new habit). Send that part on its own.
 - **Popup "This draft was replaced by a newer one."**: you tapped an older
-  card. Only your latest draft can be approved.
+  card. Only your latest draft can be saved.
 
 ---
 
-## 3. Reminders and time
+## 3. Asking about your routine
 
-### What a reminder does
+### What you can ask
 
-Once a day, at the time you choose, the bot checks your habits and sends
-**one** check-in message, but only if there is something to act on:
-
-```
-⏰ Evening check-in
-🔥 Running: log it today to keep your 5-day streak going.
-🌱 Reels: you started yesterday. Log it today to make it 2 days.
-Not logged yet today: Meditation.
-✅ Done today: Reading.
-Just reply here, like “ran 3 miles”.
-```
-
-If everything is already logged, **no message is sent**.
-
-### Setting it
-
-| You send | Result |
+| You ask | You get |
 |---|---|
-| `/remind 21:00` | Daily at 21:00 |
-| `/remind 9pm`, `/remind 9:15 PM` | 12-hour clock works too (21:00, 21:15) |
-| `/remind 7` | A bare number is the 24-hour clock: 07:00 |
-| `/remind 12am` / `/remind 12pm` | Midnight / noon |
-| `/remind` | Shows the current setting |
-| `/remind off` | Stops reminders. The time is remembered for next time |
-| `/remind 20:30` | Changes the time. The old schedule is replaced, never duplicated |
+| `how much did I read this month?` | 💬 60 pages of Reading this month, on 12 days. |
+| `how many hours did I work last week` | 💬 38.5 hours of Work last week, on 5 days. |
+| `did I meditate today` | 💬 Yes, 15 minutes of Meditation today. |
+| `how many km did I run this week` | Converted for you, even if you logged miles |
+| `what's my reading pattern` | A sentence about it plus a small table (by weekday) |
+| `how many hours did I work each week this month` | A table by week |
+| `which habit did I do most often last week` | A ranked table |
+| `what's my longest running streak` | Start, end and length |
+| `which days this week did I skip meditation` | The days with no log |
 
-Rejected (the bot replies "I didn't understand that time"): `25:00`, `9:60`,
-`13pm`, `noon`, `9.30`. There is one reminder per chat.
+Periods it understands: today, yesterday, this/last week, this/last month,
+this/last year, "in August", "last 7 days", "past 3 months". Without a
+period, the answer covers all time. Weeks start on Monday, and every date is
+in `APP_TIMEZONE`.
 
-### How the timing works
+Every answer has a **🔍 SQL** button that shows the exact query used. The
+number you see always comes from that query run on your data. Nothing is
+estimated.
+
+### How a question is answered
 
 ```
-/remind 9pm
+"how much did I read this month?"
   │
-  ├─ bot → API  PUT /internal/reminders {"remind_at": "9pm"}
-  │             API parses it to 21:00 and stores it in reminder_settings
-  │             (survives restarts)
+  ├─ classify: rules first (question words, "?", "pattern", "average"...);
+  │            only unclear messages ask the LLM. LLM down: a number means a log.
   │
-  └─ bot schedules a daily job at 21:00 in APP_TIMEZONE
-        (python-telegram-bot's job queue, job name "reminder:<chat_id>")
-
-Every day at 21:00 (APP_TIMEZONE)
-  bot → API  GET /internal/reminders/check
-        API works out "today" in APP_TIMEZONE and sorts each active habit:
-          logged today                          → "Done today"
-          no log in the last 14 days            → skipped (dormant, no nagging)
-          streak running through yesterday      → "🔥 keep your streak" / "🌱"
-          otherwise                             → "Not logged yet today"
-  bot sends the message, or nothing if there's nothing to act on
+  ├─ simple total for one habit + one period?
+  │     yes → built-in SQL template: instant, exact, works with the AI offline
+  │     no  → the LLM writes one SELECT, given literal dates for "today",
+  │           "this month"... (never CURRENT_DATE)
+  │
+  ├─ the guard checks it: one SELECT, only habit_logs and habits, only
+  │  allowed functions, no system tables, capped at 200 rows.
+  │  Rejected or failing SQL goes back to the LLM with the reason (3 tries).
+  │
+  ├─ run in a READ ONLY transaction with a 3-second timeout
+  │
+  └─ the LLM phrases the rows as a sentence (a plain summary if it's down);
+     question, SQL, row count and answer are saved in query_log
 ```
 
-**Time zone.** The reminder time and the meaning of "today" both come from
-`APP_TIMEZONE` (default `Asia/Kolkata`). The bot uses it to schedule the job
-and the API uses it to decide what counts as today, so they always agree.
-Both read the same `.env`. If you set it, use an IANA name such as
-`Europe/London` or `America/New_York`, then run `docker compose up -d` to
-restart. Daylight-saving changes are handled automatically: 21:00 stays
-21:00 local time.
+**What the SQL can see.** Questions read the `habit_logs` view, never the raw
+tables. It already leaves out undone logs, turns an old bare `m` into meters
+or minutes, and gives `amount_in_habit_unit`: every log converted to its
+habit's unit, so 5 km and 1 mile add up correctly for a miles habit. Amounts
+that can't be converted (minutes of reading for a pages habit) are kept
+separate instead of being added to the wrong total.
 
-**What "today" means at reminder time.** The check runs when the reminder
-fires, so pick an evening time. A reminder at `00:30` would evaluate the
-*new* day, when you haven't logged anything yet, and every habit would
-show as not logged.
+**When the AI is offline** simple totals still work (they don't need it). Other
+questions get "I can't work that one out right now" with an example of what
+does work.
 
-**Streak rules used by the reminder.** A streak counts consecutive days with
-at least one log, ending today, or ending yesterday if today isn't logged
-yet. At reminder time, a habit logged yesterday but not today has a streak
-"at risk": log it before midnight (in `APP_TIMEZONE`) to keep it.
-
-**Restarts.** Settings live in the database. When the bot starts, it
-reloads every enabled reminder from the API and schedules it again. Compose
-starts the bot only after the API is healthy, so this normally just works.
-If the API happened to be unreachable at that moment, the bot logs "API not
-reachable on startup" and schedules nothing. Send `/remind` with your time
-again, or run `docker compose restart bot`.
-
-**Downtime.** If the bot isn't running at the exact reminder time, that
-day's check-in may be skipped. It isn't guaranteed to be sent late. The
-next day's runs as normal.
-
-**Checking it's scheduled.** After a bot restart, `docker compose logs bot`
-shows `reminder scheduled for <chat_id> at 21:00`. The stored setting is in
-the database:
+**Checking accuracy.** Every question is in the database:
 
 ```bash
-docker compose exec db psql -U habitflow -d habitflow -c "SELECT * FROM reminder_settings;"
+docker compose exec db psql -U habitflow -d habitflow -c \
+  "SELECT created_at, question, source, attempts, row_count, error FROM query_log ORDER BY query_id DESC LIMIT 20;"
 ```
+
+`source` is `template`, `llm` or `none` (not answered), and `attempts` counts
+the SQL tries. To measure the model itself, run the eval set:
+`cd llm && GROQ_API_KEY=... python -m evals.questions`.
 
 ---
 
@@ -249,10 +242,10 @@ docker compose exec db psql -U habitflow -d habitflow -c \
 
 | `status` | Meaning |
 |---|---|
-| `pending` | Waiting for Approve |
+| `pending` | Waiting for ✅ Save |
 | `awaiting_input` | Waiting for a unit, or for approval of a new habit |
 | `executed` | Saved |
-| `cancelled` | Discarded, or the new habit was declined |
+| `cancelled` | Cancelled, or the new habit was declined |
 | `superseded` | Replaced by a newer draft in the same chat |
 | `failed` | Couldn't be understood; the reason is in `error_message` |
 
@@ -267,8 +260,12 @@ Edit correction made to it.
 2. **Change the code.**
    - **Database schema:** add `api/migrations/NNNN_name.sql` (next number,
      idempotent `IF NOT EXISTS`). The API applies it at startup everywhere.
-   - **LLM behaviour:** edit `llm/semantics.yaml`. The API tests fail if a
-     SQL example there wouldn't pass the SQL guard.
+   - **LLM behaviour:** edit `llm/semantics.yaml` (logging: `rules`, `units`,
+     `sql_examples`; questions: `classifier`, `query`, `answer`). The API tests
+     fail if a SQL example there wouldn't pass the SQL guards, or a question
+     example wouldn't run on the `habit_logs` view.
+   - **What questions can read:** the `habit_logs` view (a migration) and the
+     function whitelist in `api/app/sqlguard.py` (`check_select_sql`).
 3. **Test everything.** This needs no Docker: the tests start a throwaway
    Postgres themselves.
    ```bash
@@ -281,7 +278,10 @@ Edit correction made to it.
    cd llm && GROQ_API_KEY=... python -m evals.run --min-pass 0.9
    ```
    This makes 33 Groq requests. It shows each failing case and which fields
-   were missed.
+   were missed. For questions (routing and text-to-SQL):
+   ```bash
+   cd llm && GROQ_API_KEY=... python -m evals.questions --min-pass 0.9
+   ```
 5. **Push and open a PR.** CI runs lint plus the api, llm, bot and e2e
    suites. Merge only when it's green.
 6. **Deploy:** on the machine running the bot, `git pull && docker compose up -d --build`,
@@ -395,7 +395,7 @@ CU-hours of compute a month, and a 6-hour restore window.
 **Staying inside the free compute.** Neon sleeps after 5 minutes with no open
 connection. For `*.neon.tech` hosts the API reuses connections while you're
 active and closes them all after a quiet minute, and the health checks don't
-touch the database, so Neon wakes only when you use the bot or a reminder runs. That's typically a few
+touch the database, so Neon wakes only when you use the bot. That's typically a few
 CU-hours a month, not the ~180 that an always-open connection would cost.
 `DATABASE_POOL=on|idle|off` overrides the automatic choice. The first message
 after a quiet spell takes a few hundred milliseconds longer while Neon wakes.
@@ -414,9 +414,9 @@ now and then (it dumps the Neon database when `DATABASE_URL` is set).
 | "I can't reach the server right now" | API down or unhealthy | `docker compose ps`, then `docker compose logs api` |
 | API crashes mentioning `psycopg2` | `DATABASE_URL` is missing `+psycopg` | Fix `.env`, then `docker compose up -d` |
 | Every card says ⚡ AI is offline | Bad Groq key, wrong model name, or rate limit | `docker compose logs llm` |
+| A question gets "I can't work that one out right now" | The LLM is offline; only simple totals work without it | `docker compose logs llm`; ask "how much did I … this month" meanwhile |
+| An answer looks wrong | Tap 🔍 SQL to see the query; check the habit and dates it used | `query_log` has every question and its SQL (section 3) |
 | "Sorry, I couldn't turn that into a log" | The model failed 3 times | Rephrase ("ran 3 miles"); the reason is in `audit_log.error_message` |
 | Logs land on the wrong day | `APP_TIMEZONE` isn't your zone | Set it in `.env`, then `docker compose up -d` |
-| Reminder never arrives | Not set; nothing needed logging (it stays quiet on purpose); or the bot was down at that time | `/remind` to check; `docker compose logs bot` for "reminder scheduled" |
-| Reminder at the wrong hour | `APP_TIMEZONE` differs from where you are | Set `APP_TIMEZONE`, restart, then `/remind <time>` again |
 | Bot keeps asking the same question | An old question is still open | `/cancel` |
 | Undo says "Nothing to undo" | Everything recent is already undone | `/today` shows what's still logged |

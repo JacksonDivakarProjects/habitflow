@@ -1,4 +1,4 @@
-"""Streaks, totals and reminders. Voided logs never count. Totals convert
+"""Streaks and totals. Voided logs never count. Totals convert
 between compatible units (km/miles, minutes/hours) via app.units."""
 
 from datetime import date, timedelta
@@ -10,8 +10,6 @@ from sqlalchemy.orm import Session
 from app.models import DailyLog, Habit
 from app.timeutil import friendly_date, today
 from app.units import convert, resolve
-
-RECENT_DAYS = 14  # reminders skip habits untouched for longer than this
 
 
 def _live():
@@ -116,27 +114,3 @@ def habit_stats(db: Session, since: date) -> list[dict]:
         for g in groups.values()
     ]
     return sorted(result, key=lambda r: (r["habit"], r["metric"]))
-
-
-def reminder_check(db: Session, ref: Optional[date] = None) -> dict:
-    """What an evening check-in should mention: streaks that end tonight
-    unless logged, and recently-active habits not logged today."""
-    ref = ref or today()
-    at_risk, not_logged, done = [], [], []
-    habits = db.execute(
-        select(Habit).where(Habit.is_active).order_by(Habit.display_name)
-    ).scalars()
-    for habit in habits:
-        days = _logged_days(db, habit.habit_id, ref)
-        if ref in days:
-            done.append(habit.display_name)
-            continue
-        if not any(d >= ref - timedelta(days=RECENT_DAYS) for d in days):
-            continue  # dormant habit: don't nag
-        streak = streak_days(db, habit.habit_id, ref)
-        if streak >= 1:
-            at_risk.append({"habit": habit.display_name, "streak_days": streak})
-        else:
-            not_logged.append(habit.display_name)
-    at_risk.sort(key=lambda r: -r["streak_days"])
-    return {"date": ref.isoformat(), "at_risk": at_risk, "not_logged": not_logged, "done": done}

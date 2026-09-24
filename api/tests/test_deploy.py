@@ -55,7 +55,7 @@ def _state(engine) -> dict:
             "has_voided_at": c.execute(text(
                 "SELECT count(*) FROM information_schema.columns "
                 "WHERE table_name = 'daily_logs' AND column_name = 'voided_at'")).scalar() == 1,
-            "has_reminders": c.execute(text(
+            "reminder_table": c.execute(text(
                 "SELECT to_regclass('reminder_settings') IS NOT NULL")).scalar(),
             "versions": c.execute(text(
                 "SELECT version FROM schema_migrations ORDER BY version")).scalars().all(),
@@ -70,7 +70,7 @@ def test_fresh_empty_database_gets_everything():
     with scratch_database("habitflow_fresh") as engine:
         assert run_migrations(engine) == ALL_VERSIONS
         state = _state(engine)
-        assert (state["habits"], state["has_voided_at"], state["has_reminders"]) == (6, True, True)
+        assert (state["habits"], state["has_voided_at"], state["reminder_table"]) == (6, True, False)
         assert run_migrations(engine) == []
 
 
@@ -85,7 +85,7 @@ def test_database_created_by_old_db_init_upgrades_cleanly():
         state = _state(engine)
         assert state["habits"] == 6     # seed didn't duplicate the starter habits
         assert state["logs"] == 1       # user data kept
-        assert state["has_voided_at"] and state["has_reminders"]
+        assert state["has_voided_at"] and not state["reminder_table"]
 
 
 def test_existing_install_that_already_ran_0001_and_0002(tmp_path):
@@ -99,13 +99,14 @@ def test_existing_install_that_already_ran_0001_and_0002(tmp_path):
         ]
         _raw(engine, "INSERT INTO reminder_settings (chat_id, remind_at) VALUES (42, '21:00')")
 
-        assert run_migrations(engine) == ["0000_baseline", "0000_seed_habits"]
+        applied = run_migrations(engine)
+        assert applied[:2] == ["0000_baseline", "0000_seed_habits"]
+        assert "0003_drop_reminder_settings" in applied
 
         state = _state(engine)
         assert state["versions"] == ALL_VERSIONS
         assert state["habits"] == 6
-        with engine.connect() as c:
-            assert c.execute(text("SELECT chat_id FROM reminder_settings")).scalars().all() == [42]
+        assert not state["reminder_table"]  # reminders were removed; their table goes too
 
 
 @pytest.mark.parametrize("path", sorted(MIGRATIONS_DIR.glob("*.sql")), ids=lambda p: p.stem)

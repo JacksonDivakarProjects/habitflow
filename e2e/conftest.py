@@ -6,6 +6,7 @@ tap() presses a button on a message, and every bot message and edit is kept.
 """
 
 import asyncio
+import html
 import importlib.util
 import itertools
 import os
@@ -35,6 +36,20 @@ _spec.loader.exec_module(harness)
 pytest_configure = harness.pytest_configure
 migrated, clean_db, db = harness.migrated, harness.clean_db, harness.db
 fake_llm, make_intent = harness.fake_llm, harness.make_intent
+llm_http = harness.llm_http  # autouse: /classify, /query_sql, /answer are scripted or offline
+
+
+def _from_html(text: str) -> str:
+    """What Telegram hands back as message.text after rendering HTML."""
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def _rendered(text: str, parse_mode) -> str:
+    if parse_mode == "HTML":
+        return _from_html(text)
+    if parse_mode == "Markdown":
+        return _plain(text)
+    return text
 
 
 def _plain(text: str) -> str:
@@ -54,6 +69,10 @@ class Message:
     edits: list[str] = field(default_factory=list)
 
     @property
+    def message_id(self) -> int:  # as on a real telegram.Message
+        return self.id
+
+    @property
     def buttons(self) -> list[str]:
         if not self.markup:
             return []
@@ -70,9 +89,9 @@ class Chat:
         self.context = SimpleNamespace(
             user_data={},
             args=[],
-            job_queue=None,
             bot=SimpleNamespace(
                 edit_message_text=self._edit_by_id,
+                edit_message_reply_markup=self._edit_markup_by_id,
                 send_chat_action=AsyncMock(),
                 send_message=self._send_message,
             ),
@@ -80,8 +99,7 @@ class Chat:
 
     # --- what the bot calls -------------------------------------------
     def _add(self, text, markup=None, parse_mode=None, from_user=False) -> Message:
-        stored = _plain(text) if parse_mode == "Markdown" else text
-        msg = Message(next(self._ids), stored, markup, from_user)
+        msg = Message(next(self._ids), _rendered(text, parse_mode), markup, from_user)
         self.messages.append(msg)
         return msg
 
@@ -93,11 +111,14 @@ class Chat:
 
     def _edit(self, msg: Message, text, reply_markup=None, parse_mode=None):
         msg.edits.append(msg.text)
-        msg.text = _plain(text) if parse_mode == "Markdown" else text
+        msg.text = _rendered(text, parse_mode)
         msg.markup = reply_markup
 
     async def _edit_by_id(self, chat_id, message_id, text, reply_markup=None, parse_mode=None):
         self._edit(self._by_id(message_id), text, reply_markup, parse_mode)
+
+    async def _edit_markup_by_id(self, chat_id, message_id, reply_markup=None):
+        self._by_id(message_id).markup = reply_markup
 
     def _by_id(self, message_id) -> Message:
         return next(m for m in self.messages if m.id == message_id)
@@ -124,6 +145,10 @@ class Chat:
             asyncio.run(self.bot.handle_text(update, self.context))
         return [m.text for m in self.messages[before:] if not m.from_user]
 
+    def texts_since(self, index: int) -> list[str]:
+        """Texts of the bot messages sent after self.messages[index]."""
+        return [m.text for m in self.messages[index:] if not m.from_user]
+
     def tap(self, label: str, message: Message | None = None) -> Message:
         """Press the button labelled `label` (on the latest message that has it)."""
         if message is None:
@@ -143,6 +168,9 @@ class Chat:
         async def edit(text, reply_markup=None, parse_mode=None):
             self._edit(message, text, reply_markup, parse_mode)
 
+        async def edit_markup(reply_markup=None):
+            message.markup = reply_markup
+
         update = SimpleNamespace(
             effective_user=SimpleNamespace(id=self.user_id),
             effective_chat=SimpleNamespace(id=self.user_id),
@@ -151,7 +179,9 @@ class Chat:
                 data=button.callback_data,
                 answer=answer,
                 edit_message_text=edit,
-                message=SimpleNamespace(message_id=message.id, text=message.text),
+                edit_message_reply_markup=edit_markup,
+                message=SimpleNamespace(message_id=message.id, text=message.text,
+                                        reply_text=self._reply),
             ),
         )
         asyncio.run(self.bot.button_callback(update, self.context))
