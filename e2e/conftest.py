@@ -85,6 +85,7 @@ class Chat:
         self.user_id = user_id
         self.messages: list[Message] = []
         self.popups: list[str] = []
+        self.deleted: list[Message] = []
         self._ids = itertools.count(1)
         self.context = SimpleNamespace(
             user_data={},
@@ -171,6 +172,10 @@ class Chat:
         async def edit_markup(reply_markup=None):
             message.markup = reply_markup
 
+        async def delete():
+            self.messages.remove(message)
+            self.deleted.append(message)
+
         update = SimpleNamespace(
             effective_user=SimpleNamespace(id=self.user_id),
             effective_chat=SimpleNamespace(id=self.user_id),
@@ -181,7 +186,7 @@ class Chat:
                 edit_message_text=edit,
                 edit_message_reply_markup=edit_markup,
                 message=SimpleNamespace(message_id=message.id, text=message.text,
-                                        reply_text=self._reply),
+                                        reply_text=self._reply, delete=delete),
             ),
         )
         asyncio.run(self.bot.button_callback(update, self.context))

@@ -1,7 +1,7 @@
 """
 Prompts for questions about the logs (semantics.yaml: classifier, query, answer).
 
-classify   message -> {"kind": "log" | "query" | "edit" | "chat"}
+classify   message -> {"kind": "log" | "query" | "chat"}
 query_sql  question -> {"sql": "SELECT ..." | null, "note": str | null}
 answer     question + rows -> {"answer": str}
 
@@ -57,14 +57,14 @@ KNOWN HABITS:
 EXAMPLES:
 {examples}
 
-Return ONLY JSON: {{"kind": "log" | "query" | "edit" | "chat"}}"""
+Return ONLY JSON: {{"kind": "log" | "query" | "chat"}}"""
 
 
 def classify(text: str, habits: list[dict]) -> dict:
     reply = _chat_json(classify_prompt(habits), [{"role": "user", "content": text}])
     kind = reply.get("kind")
     # Anything else is None: the API then falls back (a number means a log).
-    return {"kind": kind if kind in ("log", "query", "edit", "chat") else None}
+    return {"kind": kind if kind in ("log", "query", "chat") else None}
 
 
 # ------------------------------------------------------------------

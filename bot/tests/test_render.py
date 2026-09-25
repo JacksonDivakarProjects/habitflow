@@ -126,27 +126,69 @@ def test_template_answer_is_just_the_sentence():
     assert buttons(markup) == [("🔍 SQL", "qsql:9")]
 
 
-def test_llm_answer_with_rows_gets_a_table():
+def test_label_and_number_rows_become_a_bar_chart():
     text, _ = bot.render_answer({
         "ok": True, "source": "llm", "answer": "You read most on Wednesdays.",
         "columns": ["weekday_name", "pages"],
-        "rows": [["Tuesday", 20], ["Wednesday", 30.5], ["Saturday", None]],
+        "rows": [["Tuesday", 20], ["Wednesday", 30.5], ["Saturday", None], ["Sunday", 3]],
         "sql": "SELECT ...", "query_id": 9})
-    assert text.startswith("💬 You read most on Wednesdays.\n<pre>")
-    table = text.split("<pre>")[1].split("</pre>")[0]
-    assert table.splitlines() == [
-        "weekday name  pages",
-        "────────────  ─────",
-        "Tuesday          20",
-        "Wednesday      30.5",
-        "Saturday          —",
+    head, chart = text.split("\n<pre>")
+    assert head == "💬 You read most on Wednesdays.\n\n📊 <i>pages by weekday name</i>"
+    assert chart.removesuffix("</pre>").splitlines() == [
+        "Tuesday    ██████▌       20",
+        "Wednesday  ██████████  30.5",
+        "Saturday                  —",
+        "Sunday     █              3",
     ]
 
 
-def test_single_row_answer_has_no_table():
+def test_chart_lines_fit_a_phone():
+    rows = [["A very long habit name indeed", 123456.78], ["b", 1]]
+    text, _ = bot.render_answer({"ok": True, "source": "llm", "answer": "x",
+                                 "columns": ["habit", "total"], "rows": rows})
+    chart = text.split("<pre>")[1].split("</pre>")[0]
+    assert all(len(line) <= 36 for line in chart.splitlines())
+    assert chart.startswith("A very lon…")
+    assert "123,456.78" in chart
+
+
+def test_other_rows_become_a_list():
+    text, _ = bot.render_answer({
+        "ok": True, "source": "llm", "answer": "Work by week.",
+        "columns": ["week_start", "hours", "days"],
+        "rows": [["2026-09-14", 38.5, 5], ["2026-09-21", 9.5, 2]]})
+    assert text.split("\n\n")[1].splitlines() == [
+        "• <b>Mon 14 Sep</b> · hours 38.5 · days 5",
+        "• <b>Mon 21 Sep</b> · hours 9.5 · days 2",
+    ]
+
+
+def test_a_single_row_is_labelled_line_by_line():
+    text, _ = bot.render_answer({
+        "ok": True, "source": "llm", "answer": "Longest streak: 3 days.",
+        "columns": ["started", "ended", "days"], "rows": [["2026-09-21", "2026-09-23", 3]]})
+    assert text.split("\n\n")[1].splitlines() == [
+        "• started: <b>Mon 21 Sep</b>", "• ended: <b>Wed 23 Sep</b>", "• days: <b>3</b>"]
+
+
+def test_single_value_answer_has_nothing_under_it():
     text, _ = bot.render_answer({"ok": True, "source": "llm", "answer": "5 logs.",
                                  "columns": ["n"], "rows": [[5]], "sql": "S", "query_id": 1})
-    assert "<pre>" not in text
+    assert text == "💬 5 logs."
+
+
+def test_long_results_say_how_many_more(monkeypatch):
+    monkeypatch.setattr(bot, "ANSWER_MAX_ROWS", 2)
+    text, _ = bot.render_answer({"ok": True, "source": "llm", "answer": "Days.",
+                                 "columns": ["day", "pages"],
+                                 "rows": [["2026-09-21", 1], ["2026-09-22", 2], ["2026-09-23", 3]]})
+    assert text.endswith("<i>…and 1 more rows.</i>") and "Wed 23 Sep" not in text
+
+
+def test_markdown_from_the_model_is_cleaned():
+    text, _ = bot.render_answer({"ok": True, "source": "llm", "rows": [],
+                                 "answer": "## Summary\n**30 pages** on `Wednesday`\n* keep going"})
+    assert text == "💬 Summary\n<b>30 pages</b> on Wednesday\n• keep going"
 
 
 def test_failed_answer():
@@ -155,27 +197,23 @@ def test_failed_answer():
     assert text == "🤔 LLM offline." and markup is None
 
 
-def test_table_dates_long_cells_and_limits(monkeypatch):
-    monkeypatch.setattr(bot, "TABLE_MAX_ROWS", 2)
-    monkeypatch.setattr(bot, "TABLE_MAX_COLS", 2)
-    table = bot.format_table(
-        ["week_start", "a_really_long_column_name", "extra"],
-        [["2026-09-21", "x" * 40, 1], ["2026-09-14", "y", 2], ["2026-09-07", "z", 3]])
-    lines = table.splitlines()
-    assert lines[0].startswith("week start  a really long c…")
-    assert lines[2].startswith("Mon 21 Sep  xxxxxxxxxxxxxxx…")
-    assert lines[-2:] == ["… and 1 more", "(1 more columns not shown)"]
-
-
-def test_table_booleans_and_html_escaping():
+def test_values_and_html_escaping():
     text, _ = bot.render_answer({"ok": True, "source": "llm", "answer": "a < b",
-                                 "columns": ["x"], "rows": [[True], ["<i>"]]})
-    assert "a &lt; b" in text and "&lt;i&gt;" in text and "yes" in text
+                                 "columns": ["x", "flag"], "rows": [["<i>", True], ["y", False]]})
+    assert "a &lt; b" in text and "<b>&lt;i&gt;</b> · flag yes" in text
+    assert bot._cell(1250) == "1,250" and bot._cell(2.50) == "2.5" and bot._cell(None) == "—"
 
 
-def test_sql_message():
-    assert bot.render_sql("SQL used", "  SELECT 1 < 2\n") == (
-        "🔍 <b>SQL used</b>\n<pre>SELECT 1 &lt; 2</pre>")
+def test_negative_numbers_are_listed_not_charted():
+    text, _ = bot.render_answer({"ok": True, "source": "llm", "answer": "Change.",
+                                 "columns": ["week", "change"], "rows": [["a", -3], ["b", 5]]})
+    assert "<pre>" not in text and "• <b>a</b> · change -3" in text
+
+
+def test_sql_message_has_a_close_button():
+    text, markup = bot.render_sql("SQL used", "  SELECT 1 < 2\n")
+    assert text == "🔍 <b>SQL used</b>\n<pre>SELECT 1 &lt; 2</pre>"
+    assert buttons(markup) == [("✖ Close", "close:0")]
 
 
 # ------------------------------------------------------------------
@@ -221,63 +259,3 @@ def test_legacy_buttons_map_to_new_actions():
     assert bot._parse_callback("unit:7:km") == ("unit", 7, "km")
     with pytest.raises(ValueError):
         bot._parse_callback("nonsense")
-
-
-# ------------------------------------------------------------------
-# Changing saved logs
-# ------------------------------------------------------------------
-BEFORE = {"log_id": 3, "habit": "Running", "amount": 5.0, "unit": "km", "quantity": "5 km",
-          "log_date": "2026-09-23", "when": "yesterday"}
-AFTER = {**BEFORE, "amount": 6.0, "quantity": "6 km"}
-
-
-def test_edit_confirm_card_shows_what_changes():
-    text, markup = bot.render_edit({"edit_id": 4, "status": "pending", "action": "edit",
-                                    "before": BEFORE, "after": AFTER})
-    assert text == "✏️ <b>Change this log?</b>\n• <b>Running</b> · 5 km → <b>6 km</b> · yesterday"
-    assert buttons(markup) == [("✅ Apply", "eapply:4"), ("✖ Cancel", "ecancel:4")]
-
-
-def test_edit_moving_a_day():
-    moved = {**BEFORE, "when": "today"}
-    text, _ = bot.render_edit({"edit_id": 4, "status": "pending", "action": "edit",
-                               "before": BEFORE, "after": moved})
-    assert "5 km · yesterday → <b>today</b>" in text
-
-
-def test_delete_confirm_card():
-    text, markup = bot.render_edit({"edit_id": 4, "status": "pending", "action": "delete",
-                                    "before": BEFORE})
-    assert text == "🗑 <b>Delete this log?</b>\n• <b>Running</b> · 5 km · yesterday"
-    assert buttons(markup) == [("🗑 Delete", "eapply:4"), ("✖ Keep it", "ecancel:4")]
-
-
-def test_choose_between_logs():
-    other = {**BEFORE, "log_id": 9, "quantity": "2 miles", "when": "on Mon 21 Sep"}
-    text, markup = bot.render_edit({"edit_id": 4, "status": "choosing", "action": "delete",
-                                    "candidates": [BEFORE, other]})
-    assert text == "🔎 <b>Which one should I delete?</b>"
-    assert buttons(markup) == [("Running · 5 km · yesterday", "epick:4:3"),
-                               ("Running · 2 miles · Mon 21 Sep", "epick:4:9"),
-                               ("✖ Cancel", "ecancel:4")]
-
-
-def test_edit_done_undone_cancelled_unclear():
-    text, markup = bot.render_edit({"edit_id": 4, "status": "applied", "action": "edit",
-                                    "before": BEFORE, "after": AFTER})
-    assert text == ("✅ <b>Changed</b>\n• <b>Running</b> · 6 km · yesterday\n"
-                    "<i>was 5 km · yesterday</i>")
-    assert buttons(markup) == [("↩️ Undo", "erevert:4")]
-    text, _ = bot.render_edit({"edit_id": 4, "status": "applied", "action": "delete",
-                               "before": BEFORE})
-    assert text == "🗑 <b>Deleted</b>: 5 km of Running yesterday"
-    text, markup = bot.render_edit({"edit_id": 4, "status": "reverted", "action": "delete",
-                                    "before": BEFORE})
-    assert text.startswith("↩️ <b>Put back</b>") and markup is None
-    assert bot.render_edit({"status": "cancelled"})[0] == "✖ OK, I left it as it was."
-    text, markup = bot.render_edit({"status": "unclear", "message": "Which log? <x>"})
-    assert text == "🤔 Which log? &lt;x&gt;" and markup is None
-
-
-def test_help_mentions_fixing_logs():
-    assert "change yesterday's run to 6 km" in bot.HELP_TEXT

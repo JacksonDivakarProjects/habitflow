@@ -419,3 +419,17 @@ def test_prompt_examples_pass_the_guard_and_run(db, history):
         error, runnable = check_select_sql(ex["sql"])
         assert error is None, (ex["question"], error)
         querying.run_readonly(db, runnable)
+
+
+def test_rows_sent_for_phrasing_have_readable_dates(client, history, llm_http):
+    llm_http.queue("/query_sql", {"sql": "SELECT week_start, sum(amount) AS total FROM habit_logs "
+                                         "WHERE habit = 'work' GROUP BY 1 ORDER BY 1"})
+    llm_http.queue("/answer", {"answer": "ok"})
+    body = ask(client, "how many hours did I work each week")
+    assert body["rows"][0][0] == "2026-09-14"                      # the data stays exact
+    sent = llm_http.payloads("/answer")[0]["rows"]
+    assert sent[0][0] == "Mon 14 Sep"                               # the LLM sees it readable
+
+
+def test_readable_rows_keep_other_values():
+    assert querying.readable_rows([["2025-12-01", 3, None, "x"]]) == [["Mon 1 Dec 2025", 3, None, "x"]]

@@ -157,7 +157,6 @@ classifier:
   kinds:
     log: "the user reports something they did, to be recorded (usually has an amount)"
     query: "the user asks about their own past activity: totals, patterns, streaks, comparisons"
-    edit: "the user wants to change or delete something already logged (a wrong amount, unit or day)"
     chat: "greetings, thanks, help, or anything unrelated to logging or their data"
   examples:
     - {text: "read today", kind: query}
@@ -166,8 +165,6 @@ classifier:
     - {text: "meditated before bed", kind: log}
     - {text: "reading lately", kind: query}
     - {text: "pushups twenty", kind: log}
-    - {text: "yesterday's run should've been 6 km", kind: edit}
-    - {text: "that reading on monday was wrong, remove it", kind: edit}
     - {text: "tell me a joke", kind: chat}
     - {text: "is it going well", kind: query}
 
@@ -264,9 +261,11 @@ query:
 # ------------------------------------------------------------
 answer:
   rules:
-    - "answer the question directly in 1-3 short sentences, using ONLY the numbers in ROWS; never invent or estimate"
-    - "say amounts with their units (\"320 pages\", \"12.5 hours\") and name the period (\"this month\", \"last week\")"
-    - "for patterns, point out the highlight (best day, trend up or down, consistency) in plain words"
-    - "if ROWS is empty, say nothing was logged for that and suggest logging, e.g. \"No reading logged this month yet.\""
+    - "answer the question directly in 1-2 short sentences, using ONLY the numbers in ROWS; never invent or estimate"
+    - "every number you write must be a value from ROWS (or a sum you add up correctly), and must say what it is: \"30.5 pages on Wednesdays\", not \"30.5 pages this week\" when 30.5 is one row"
+    - "name a period only if the QUESTION or the SQL filters on one (\"this month\", \"last week\"); otherwise don't mention a period"
+    - "start with the key fact and its unit (\"320 pages\", \"12.5 hours\")"
+    - "for patterns, name the highlight (best day, trend up or down, how consistent) instead of repeating every row: the app shows the rows under your sentence as a chart or list"
+    - "if ROWS is empty, say nothing was logged for that, e.g. \"No reading logged this month yet.\""
     - "if TRUNCATED is true, say these are the first rows only"
-    - "friendly and encouraging, no markdown tables (the app shows the table), at most one emoji"
+    - "plain text only: no markdown, no asterisks, no bullet lists, no tables, no headings; at most one emoji; friendly and encouraging"

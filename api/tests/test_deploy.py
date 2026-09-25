@@ -116,3 +116,15 @@ def test_every_migration_is_idempotent(path):
         run_migrations(engine)
         _raw(engine, path.read_text())  # second time, outside the runner
         assert _state(engine)["habits"] == 6
+
+
+def test_install_from_the_release_with_log_edits_drops_the_table():
+    """all-1.4.0 created log_edits (0005); the feature was removed, 0006 drops it."""
+    with scratch_database("habitflow_logedits") as engine:
+        run_migrations(engine)
+        _raw(engine, "CREATE TABLE log_edits (edit_id BIGSERIAL PRIMARY KEY); "
+                     "INSERT INTO schema_migrations (version) VALUES ('0005_log_edits'); "
+                     "DELETE FROM schema_migrations WHERE version = '0006_drop_log_edits'")
+        assert run_migrations(engine) == ["0006_drop_log_edits"]
+        with engine.connect() as c:
+            assert c.execute(text("SELECT to_regclass('log_edits')")).scalar() is None

@@ -144,7 +144,7 @@ def test_an_answer_with_rows_shows_a_table(api):
     api.on("POST", "/internal/message", json=message("answer", answer=answer))
     update = make_update("what's my reading pattern")
     run(bot.handle_text(update, make_context()))
-    assert "<pre>weekday name  pages" in replies(update)[0]
+    assert "📊 <i>pages by weekday name</i>" in replies(update)[0]
 
 
 def test_small_talk_gets_help(api):
@@ -500,9 +500,8 @@ def test_draft_sql_button(api):
     run(bot.button_callback(update, make_context()))
     assert query_replies(update) == [
         "🔍 <b>SQL for this log</b>\n<pre>INSERT INTO daily_logs &lt;x&gt;</pre>"]
-    new_markup = update.callback_query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
-    assert ("🔍 SQL", "sql:7") not in buttons(new_markup)
-    assert ("✅ Save", "save:7") in buttons(new_markup)
+    assert buttons(markup_of(update.callback_query.message.reply_text)) == [("✖ Close", "close:0")]
+    update.callback_query.edit_message_reply_markup.assert_not_awaited()  # card keeps its buttons
 
 
 def test_draft_without_sql(api):
@@ -519,7 +518,28 @@ def test_answer_sql_button(api):
     update = make_update(callback_data="qsql:9")
     run(bot.button_callback(update, make_context()))
     assert query_replies(update) == ["🔍 <b>SQL used (built-in template)</b>\n<pre>SELECT 1</pre>"]
-    update.callback_query.edit_message_reply_markup.assert_awaited_with(reply_markup=None)
+    assert buttons(markup_of(update.callback_query.message.reply_text)) == [("✖ Close", "close:0")]
+    update.callback_query.edit_message_reply_markup.assert_not_awaited()  # can be opened again
+
+
+def test_close_removes_the_sql_message(api):
+    from unittest.mock import AsyncMock
+
+    update = make_update(callback_data="close:0")
+    update.callback_query.message.delete = AsyncMock()
+    run(bot.button_callback(update, make_context()))
+    update.callback_query.message.delete.assert_awaited_once()
+    update.callback_query.answer.assert_awaited_once()
+    assert api.requests == []
+
+
+def test_close_falls_back_when_telegram_refuses_to_delete(api):
+    from unittest.mock import AsyncMock
+
+    update = make_update(callback_data="close:0")
+    update.callback_query.message.delete = AsyncMock(side_effect=RuntimeError("too old"))
+    run(bot.button_callback(update, make_context()))
+    assert edited(update) == "🔍 SQL closed."
 
 
 def test_answer_sql_gone(api):
@@ -672,89 +692,3 @@ def test_startup_registers_the_command_menu_only():
     run(bot.on_startup(app))
     names = [c.command for c in app.bot.set_my_commands.await_args.args[0]]
     assert names == [n for n, _ in bot.COMMANDS] and "remind" not in names
-
-
-# ------------------------------------------------------------------
-# Changing saved logs
-# ------------------------------------------------------------------
-BEFORE = {"log_id": 3, "habit": "Running", "amount": 5.0, "unit": "km", "quantity": "5 km",
-          "log_date": "2026-09-23", "when": "yesterday"}
-AFTER = {**BEFORE, "amount": 6.0, "quantity": "6 km"}
-PENDING = {"edit_id": 4, "status": "pending", "action": "edit", "before": BEFORE,
-           "after": AFTER, "candidates": [], "message": None, "already": False}
-
-
-def test_edit_request_shows_a_confirm_card(api):
-    api.on("POST", "/internal/message", json=message("edit", edit=PENDING))
-    update = make_update("change yesterday's run to 6 km")
-    run(bot.handle_text(update, make_context()))
-    assert replies(update) == [
-        "✏️ <b>Change this log?</b>\n• <b>Running</b> · 5 km → <b>6 km</b> · yesterday"]
-    assert buttons(markup_of(update.message.reply_text))[0] == ("✅ Apply", "eapply:4")
-
-
-def test_unclear_edit_request(api):
-    api.on("POST", "/internal/message", json=message(
-        "edit", edit={"status": "unclear", "message": "Which log?", "candidates": []}))
-    update = make_update("change it")
-    run(bot.handle_text(update, make_context()))
-    assert replies(update) == ["🤔 Which log?"]
-
-
-def test_apply_edit_then_undo(api):
-    api.on("POST", "/internal/edits/4/apply", json={**PENDING, "status": "applied"})
-    update = make_update(callback_data="eapply:4")
-    run(bot.button_callback(update, make_context()))
-    assert edited(update).startswith("✅ <b>Changed</b>")
-    assert buttons(markup_of(update.callback_query.edit_message_text)) == [("↩️ Undo", "erevert:4")]
-
-    api.on("POST", "/internal/edits/4/undo", json={**PENDING, "status": "reverted"})
-    update = make_update(callback_data="erevert:4")
-    run(bot.button_callback(update, make_context()))
-    assert edited(update).startswith("↩️ <b>Put back</b>")
-
-
-def test_pick_a_log_then_cancel(api):
-    api.on("POST", "/internal/edits/4/choose", json=PENDING)
-    update = make_update(callback_data="epick:4:3")
-    run(bot.button_callback(update, make_context()))
-    assert body(api) == {"log_id": 3}
-    assert edited(update).startswith("✏️ <b>Change this log?</b>")
-
-    api.on("POST", "/internal/edits/4/cancel", json={**PENDING, "status": "cancelled"})
-    update = make_update(callback_data="ecancel:4")
-    run(bot.button_callback(update, make_context()))
-    assert edited(update) == "✖ OK, I left it as it was."
-
-
-def test_edit_refusal_shows_the_apis_words(api):
-    api.on("POST", "/internal/edits/4/apply", status=409,
-           json={"detail": "A newer change replaced this one."})
-    update = make_update(callback_data="eapply:4")
-    run(bot.button_callback(update, make_context()))
-    assert popup(update) == "A newer change replaced this one."
-    update.callback_query.edit_message_text.assert_not_awaited()
-
-
-def test_edit_button_when_api_is_down(api):
-    api.on("POST", "/internal/edits/4/apply", raises=httpx.ConnectError("down"))
-    update = make_update(callback_data="eapply:4")
-    run(bot.button_callback(update, make_context()))
-    assert popup(update) == bot.UNREACHABLE
-
-
-def test_malformed_pick(api):
-    update = make_update(callback_data="epick:4:x")
-    run(bot.button_callback(update, make_context()))
-    assert edited(update) == "That button is no longer valid." and api.requests == []
-
-
-@pytest.mark.parametrize("data,path", [
-    ("eapply:4", "/internal/edits/4/apply"), ("ecancel:4", "/internal/edits/4/cancel"),
-    ("epick:4:3", "/internal/edits/4/choose"), ("erevert:4", "/internal/edits/4/undo"),
-])
-def test_edit_buttons_answer_once(api, data, path):
-    api.on("POST", path, json=PENDING)
-    update = make_update(callback_data=data)
-    run(bot.button_callback(update, make_context()))
-    update.callback_query.answer.assert_awaited_once()

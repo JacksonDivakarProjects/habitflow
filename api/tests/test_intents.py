@@ -72,13 +72,20 @@ def test_small_talk(text):
 @pytest.mark.parametrize("text", [
     "change yesterday's run to 6 km",
     "delete Monday's reading",
-    "remove my last run",
-    "please fix today's meditation",
+    "please remove my last run",
+    "fix today's meditation to 20 min",
     "yesterday's run was 6 km",
+    "monday's reading should be 30 pages",
 ])
-def test_edits(text):
+def test_requests_to_change_a_saved_log(text):
+    """Not supported (only Undo): recognised so they are explained, not logged."""
     decided = classify_rules(text, HABITS)
     assert decided and decided.kind == "edit", decided
+
+
+@pytest.mark.parametrize("text", ["ran 5 km yesterday", "read 20 pages today", "fixed bike 30 min"])
+def test_ordinary_logs_are_not_edit_requests(text):
+    assert classify_rules(text, HABITS).kind == "log"
 
 
 @pytest.mark.parametrize("text", ["read today", "sql last week", "running", "meditated"])

@@ -5,8 +5,7 @@ A personal habit tracker you talk to on Telegram. Send plain text like
 review the draft (including the SQL it wrote), and nothing is saved until
 you tap **Save**. Ask "how much did I read this month?" or "what's my
 reading pattern?" and it writes a read-only query, runs it on your data and
-answers, with the SQL one tap away. Got an old log wrong? "change yesterday's
-run to 6 km" fixes it, after you confirm, and can be undone.
+answers, with the SQL one tap away.
 
 ```
 Telegram ──> bot ──HTTP──> api ──HTTP──> llm ──> Groq (Llama 3.3 70B)
@@ -101,8 +100,9 @@ pattern?", "how many hours did I work last week?".
    in a `READ ONLY` transaction with a 3-second statement timeout. Rejected or
    failing SQL goes back to the LLM with the reason, up to 3 attempts.
 4. **Answer.** The LLM's `/answer` phrases the rows (a plain summary if it's
-   down). The bot shows the sentence, a small table when there are several
-   rows, and a **🔍 SQL** button with the exact query. Every question, its SQL,
+   down). The bot shows the sentence, then the rows as a small bar chart
+   (label + number) or a list, and a **🔍 SQL** button that opens the exact
+   query in a message with **✖ Close**. Every question, its SQL,
    row count and answer are stored in `query_log`.
 
 **The `habit_logs` view** (`api/migrations/0004_query_views.sql`) is the only
@@ -306,10 +306,9 @@ uses and stays within its free compute.
 | `/stats` | Totals and streaks for the last 30 days |
 | `/undo` | Void your most recent log (it stays in the audit trail) |
 | `ran 3 miles and read 20 pages` | One card with two lines; Save logs both |
-| `change yesterday's run to 6 km` | *Change this log? Running · 5 km → 6 km* → ✅ Apply → ↩️ Undo if needed |
-| `delete Monday's reading` | Confirm with 🗑 Delete; if several logs match you pick one |
 | `how much did I read this month?` | *60 pages of Reading this month, on 12 days.* + 🔍 SQL |
-| `what's my reading pattern` | A sentence plus a small table by weekday |
+| `what's my reading pattern` | A sentence plus a small bar chart by weekday |
+| `change yesterday's run to 6 km` | Saved logs can't be edited: it explains to use ↩️ Undo and log again |
 | `/habits` | Tracked habits and their default units |
 | `/cancel`, or reply “cancel” | Drop an open unit question or change |
 
@@ -332,7 +331,7 @@ ruff check .                                               # from repo root
 
 | Suite | What it covers |
 |---|---|
-| `api/tests` | Every draft, clarify, approve, change, undo and discard path; message routing (`test_intents.py`, `test_messages.py`); changing and deleting saved logs (`test_log_edits.py`); questions end to end: the view, dates, templates, the LLM SQL path with retries, read-only execution and timeouts (`test_querying.py`); both SQL guards including attack cases (`test_select_guard.py`); units, the regex parser, migrations. |
+| `api/tests` | Every draft, clarify, approve, change, undo and discard path; message routing (`test_intents.py`, `test_messages.py`); questions end to end: the view, dates, templates, the LLM SQL path with retries, read-only execution and timeouts (`test_querying.py`); both SQL guards including attack cases (`test_select_guard.py`); units, the regex parser, migrations. |
 | `llm/tests` | Prompt construction, the `/extract`, `/classify`, `/query_sql` and `/answer` endpoints, and the eval scorers. |
 | `bot/tests` | Rendering (cards, tables, escaping) and every handler and button with a faked API: wording, popups, "cancel" words, questions asked mid-conversation. |
 | `e2e` | Whole conversations. The real bot handlers call the real API (in process) over a real database, with only Telegram and the LLM scripted. A small `Chat` simulator records every message, button and edit. |

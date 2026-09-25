@@ -2,9 +2,10 @@
 What does a message want?
 
   log    "ran 5 km", "read 20 pages yesterday", "30"
-  edit   "change yesterday's run to 6 km", "delete Monday's reading"
   query  "how much did I read this month?", "what's my reading pattern"
   chat   "hi", "thanks", "help"
+  edit   "change yesterday's run to 6 km": not supported (only Undo), so it gets
+         an explanation instead of becoming a new 6 km log by mistake
 
 Clear cases are decided by rules (instant, no LLM). Only messages the rules
 can't place ("read today", "sql last week") go to the LLM's /classify; if the
@@ -15,11 +16,10 @@ import re
 from dataclasses import dataclass
 
 from app import llm_client
-from app.log_edits import looks_like_edit
 from app.querying import match_habits
 from app.units import ALIASES as UNIT_ALIASES
 
-KINDS = ("log", "query", "edit", "chat")
+KINDS = ("log", "query", "chat")
 
 _CHAT = re.compile(
     r"^(hi+|hello|hey+|yo|hola|thanks|thank you|thank u|thx|ty|ok|okay|k|cool|nice|great|"
@@ -37,13 +37,20 @@ _ANALYTIC = re.compile(
     r"best|worst|compare|comparison|so far|consistency|consistent|per day|per week|"
     r"per month|daily|weekly|monthly|in total|overall)\b"
 )
+# Changing a saved log: "change/delete/fix ...", or "yesterday's run was 6 km".
+_EDIT_REQUEST = re.compile(
+    r"^(?:(?:please|pls|can you|could you)\s+)?"
+    r"(?:change|edit|update|modify|correct|fix|delete|remove|erase)\b"
+    r"|\b(?:yesterday|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday)'?s?\b"
+    r".*\b(?:was|were|should be|should have been)\s+\d"
+)
 _NUMBER = re.compile(r"\d")
 _WORD = re.compile(r"[a-z]+")
 
 
 @dataclass
 class Classification:
-    kind: str  # log | query | edit | chat
+    kind: str  # log | query | chat | edit
     source: str  # rules | llm | fallback
     reason: str
 
@@ -64,8 +71,8 @@ def classify_rules(text: str, habits: list[dict]) -> Classification | None:
         return Classification("chat", "rules", "empty message")
     if _CHAT.match(lowered):
         return Classification("chat", "rules", "greeting or help")
-    if looks_like_edit(lowered):
-        return Classification("edit", "rules", "changes or deletes a saved log")
+    if _EDIT_REQUEST.search(lowered):
+        return Classification("edit", "rules", "asks to change a saved log")
     if lowered.endswith("?"):
         return Classification("query", "rules", "ends with a question mark")
     if _QUESTION_START.match(lowered):

@@ -103,3 +103,10 @@ def test_the_old_draft_endpoint_still_works(client, fake_llm, make_intent):
     fake_llm.queue(make_intent())
     r = client.post("/internal/draft", json={"chat_id": CHAT, "text": "ran 4 miles"})
     assert r.status_code == 200 and r.json()["items"][0]["quantity"] == "4 miles"
+
+
+def test_changing_a_saved_log_is_explained_not_logged(client, db, fake_llm):
+    body = send(client, "change yesterday's run to 6 km")
+    assert body["kind"] == "error" and "Undo" in body["text"]
+    assert fake_llm.calls == []                               # no 6 km draft
+    assert db.execute(select(AuditLog)).first() is None

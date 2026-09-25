@@ -102,35 +102,6 @@ class QueryLog(Base):
     )
 
 
-class LogEdit(Base):
-    """A change to a saved log, confirmed before it is applied (migration 0005)."""
-
-    __tablename__ = "log_edits"
-
-    edit_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    request: Mapped[str] = mapped_column(Text, nullable=False)
-    action: Mapped[str] = mapped_column(String(10), nullable=False)  # edit | delete
-    log_id: Mapped[int | None] = mapped_column(ForeignKey("daily_logs.log_id"))
-    candidates: Mapped[list] = mapped_column(
-        JSONB, nullable=False, server_default=text("'[]'::jsonb")
-    )
-    changes: Mapped[dict] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
-    )
-    old_values: Mapped[dict | None] = mapped_column(JSONB)
-    new_values: Mapped[dict | None] = mapped_column(JSONB)
-    status: Mapped[str] = mapped_column(
-        String(20), nullable=False, server_default=text("'pending'")
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("NOW()")
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("NOW()")
-    )
-
-
 class DailyLog(Base):
     __tablename__ = "daily_logs"
 

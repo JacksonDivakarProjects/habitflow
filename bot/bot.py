@@ -3,7 +3,6 @@ HabitFlow Telegram bot: a thin client over the API.
 
 Every message goes to POST /internal/message, which decides what it is:
   log     -> a draft card:      ✅ Save  ✏️ Change  ✖ Cancel  🔍 SQL
-  edit    -> a change to a saved log, confirmed first (✅ Apply / 🗑 Delete), with ↩️ Undo
   answer  -> the answer, a small table when there are rows, and 🔍 SQL
   chat    -> help
 Two short conversations are tracked in user_data: a unit question (answer
@@ -77,9 +76,10 @@ _QUESTION = re.compile(
     re.IGNORECASE,
 )
 
-TABLE_MAX_ROWS = 15
-TABLE_MAX_COLS = 5
-TABLE_CELL_WIDTH = 16
+# Answers: rows shown under the sentence, and the bar chart's size (fits a phone).
+ANSWER_MAX_ROWS = 12
+BAR_WIDTH = 10
+BAR_LABEL_WIDTH = 11
 
 # Buttons from cards sent by older versions keep working.
 LEGACY_ACTIONS = {
@@ -303,127 +303,119 @@ def render_saved(data: dict) -> tuple[str, InlineKeyboardMarkup | None]:
 
 
 def _cell(value) -> str:
+    """One value, as a person would write it: 1,250 · 3.5 · Mon 21 Sep · —."""
     if value is None:
         return "—"
     if isinstance(value, bool):
         return "yes" if value else "no"
-    if isinstance(value, float):
-        return f"{round(value, 2):g}"
+    if isinstance(value, (int, float)):
+        text = f"{value:,.2f}".rstrip("0").rstrip(".")
+        return "0" if text in ("-0", "") else text
     if isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
         d = date.fromisoformat(value)
         return f"{d:%a} {d.day} {d:%b}"
     return str(value)
 
 
-def format_table(columns: list[str], rows: list[list]) -> str:
-    """A small monospace table: numbers right-aligned, long cells cut."""
-    cols = columns[:TABLE_MAX_COLS]
-    shown = [r[:TABLE_MAX_COLS] for r in rows[:TABLE_MAX_ROWS]]
-    cells = [[_cell(v) for v in r] for r in shown]
-    headers = [c.replace("_", " ") for c in cols]
+def _label(column: str) -> str:
+    return column.replace("_", " ")
 
-    def cut(s: str) -> str:
-        return s if len(s) <= TABLE_CELL_WIDTH else s[: TABLE_CELL_WIDTH - 1] + "…"
 
-    headers = [cut(x) for x in headers]
-    cells = [[cut(x) for x in r] for r in cells]
-    widths = [max([len(headers[i])] + [len(r[i]) for r in cells]) for i in range(len(cols))]
-    numeric = [
-        all(
-            isinstance(r[i], (int, float)) and not isinstance(r[i], bool) or r[i] is None
-            for r in shown
-        )
-        and any(r[i] is not None for r in shown)
-        for i in range(len(cols))
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _cut(text: str, width: int) -> str:
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+_EIGHTHS = " ▏▎▍▌▋▊▉"
+
+
+def _bar(value: float, top: float) -> str:
+    """A bar of up to BAR_WIDTH blocks, in eighths of a block."""
+    if not top or value <= 0:
+        return ""
+    eighths = round(value / top * BAR_WIDTH * 8)
+    full, part = divmod(max(eighths, 1), 8)
+    return "█" * full + (_EIGHTHS[part] if part else "")
+
+
+def format_bars(columns: list[str], rows: list[list]) -> str:
+    """label + number rows as a small bar chart that fits a phone screen."""
+    shown = rows[:ANSWER_MAX_ROWS]
+    labels = [_cut(_cell(r[0]), BAR_LABEL_WIDTH) for r in shown]
+    values = [r[1] for r in shown]
+    numbers = [v for v in values if _is_number(v)]
+    top = max(numbers) if numbers else 0
+    label_w = max(len(x) for x in labels)
+    value_w = max(len(_cell(v)) for v in values)
+    lines = [
+        f"{label.ljust(label_w)}  {_bar(v, top).ljust(BAR_WIDTH)}  {_cell(v).rjust(value_w)}"
+        if _is_number(v)
+        else f"{label.ljust(label_w)}  {''.ljust(BAR_WIDTH)}  {_cell(v).rjust(value_w)}"
+        for label, v in zip(labels, values, strict=True)
     ]
+    return "\n".join(line.rstrip() for line in lines)
 
-    def line(values: list[str]) -> str:
-        return "  ".join(
-            v.rjust(widths[i]) if numeric[i] else v.ljust(widths[i]) for i, v in enumerate(values)
-        ).rstrip()
 
-    out = [line(headers), "  ".join("─" * w for w in widths)] + [line(r) for r in cells]
-    if len(rows) > TABLE_MAX_ROWS:
-        out.append(f"… and {len(rows) - TABLE_MAX_ROWS} more")
-    if len(columns) > TABLE_MAX_COLS:
-        out.append(f"({len(columns) - TABLE_MAX_COLS} more columns not shown)")
-    return "\n".join(out)
+def format_list(columns: list[str], rows: list[list]) -> str:
+    """Any other rows: one line each, first value bold, the rest labelled.
+    A single row is shown as one labelled line per column instead."""
+    if len(rows) == 1:
+        return "\n".join(
+            f"• {h(_label(c))}: <b>{h(_cell(v))}</b>"
+            for c, v in zip(columns, rows[0], strict=False)
+        )
+    lines = []
+    for r in rows[:ANSWER_MAX_ROWS]:
+        first, rest = r[0], list(zip(columns[1:], r[1:], strict=False))
+        parts = [f"{h(_label(c))} {h(_cell(v))}" for c, v in rest]
+        lines.append(" · ".join([f"• <b>{h(_cell(first))}</b>", *parts]))
+    return "\n".join(lines)
+
+
+def _fits_bars(columns: list[str], rows: list[list]) -> bool:
+    if len(columns) != 2 or len(rows) < 2:
+        return False
+    numbers = [r[1] for r in rows if r[1] is not None]
+    return bool(numbers) and all(_is_number(v) and v >= 0 for v in numbers) and not all(
+        _is_number(r[0]) for r in rows
+    )
+
+
+def _answer_text(text: str) -> str:
+    """The model's sentence as Telegram HTML: **bold** kept, other markdown dropped."""
+    text = h(text.strip())
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"(?m)^\s*#+\s*", "", text)          # headings
+    text = re.sub(r"(?m)^\s*[*-]\s+", "• ", text)      # bullets
+    return text.replace("`", "").replace("__", "")
 
 
 def render_answer(data: dict) -> tuple[str, InlineKeyboardMarkup | None]:
-    icon = "💬" if data.get("ok") else "🤔"
-    text = f"{icon} {h(data.get('answer') or 'No answer.')}"
-    rows = data.get("rows") or []
-    if data.get("ok") and data.get("source") != "template" and len(rows) >= 2:
-        text += f"\n<pre>{h(format_table(data.get('columns') or [], rows))}</pre>"
+    ok = data.get("ok")
+    icon = "💬" if ok else "🤔"
+    text = f"{icon} {_answer_text(data.get('answer') or 'No answer.')}"
+    columns, rows = data.get("columns") or [], data.get("rows") or []
+    # Template answers already say everything in their sentence.
+    if ok and data.get("source") != "template" and columns and rows:
+        if _fits_bars(columns, rows):
+            title = f"{_label(columns[1])} by {_label(columns[0])}"
+            text += f"\n\n📊 <i>{h(title)}</i>\n<pre>{h(format_bars(columns, rows))}</pre>"
+        elif len(rows) >= 2 or len(columns) >= 2:
+            text += "\n\n" + format_list(columns, rows)
+        if len(rows) > ANSWER_MAX_ROWS or data.get("truncated"):
+            more = len(rows) - ANSWER_MAX_ROWS
+            text += f"\n<i>…and {more} more rows.</i>" if more > 0 else "\n<i>…and more rows.</i>"
     markup = None
     if data.get("sql") and data.get("query_id"):
         markup = _keyboard([("🔍 SQL", f"qsql:{data['query_id']}")])
     return text, markup
 
 
-def _when(item: dict) -> str:
-    return item["when"].removeprefix("on ")
-
-
-def _changed(before: dict, after: dict, key: str) -> str:
-    """'5 km → <b>6 km</b>', or just '5 km' when that part didn't change."""
-    old, new = before[key], after[key]
-    return h(old) if old == new else f"{h(old)} → <b>{h(new)}</b>"
-
-
-def render_edit(data: dict) -> tuple[str, InlineKeyboardMarkup | None]:
-    """A change to a saved log, at any stage: choose, confirm, done, undone."""
-    edit_id, status = data.get("edit_id"), data.get("status")
-    before, after = data.get("before"), data.get("after")
-    delete = data.get("action") == "delete"
-    if status == "choosing":
-        rows = [
-            [(f"{c['habit']} · {c['quantity']} · {_when(c)}", f"epick:{edit_id}:{c['log_id']}")]
-            for c in data.get("candidates") or []
-        ]
-        verb = "delete" if delete else "change"
-        return f"🔎 <b>Which one should I {verb}?</b>", _keyboard(
-            *rows, [("✖ Cancel", f"ecancel:{edit_id}")]
-        )
-    if status == "pending" and delete:
-        return (
-            f"🗑 <b>Delete this log?</b>\n• <b>{h(before['habit'])}</b> · "
-            f"{h(before['quantity'])} · {h(before['when'])}",
-            _keyboard([("🗑 Delete", f"eapply:{edit_id}"), ("✖ Keep it", f"ecancel:{edit_id}")]),
-        )
-    if status == "pending":
-        return (
-            f"✏️ <b>Change this log?</b>\n• <b>{h(before['habit'])}</b> · "
-            f"{_changed(before, after, 'quantity')} · {_changed(before, after, 'when')}",
-            _keyboard([("✅ Apply", f"eapply:{edit_id}"), ("✖ Cancel", f"ecancel:{edit_id}")]),
-        )
-    if status == "applied":
-        undo = _keyboard([("↩️ Undo", f"erevert:{edit_id}")])
-        if delete:
-            return (
-                f"🗑 <b>Deleted</b>: {h(before['quantity'])} of {h(before['habit'])} "
-                f"{h(before['when'])}",
-                undo,
-            )
-        return (
-            f"✅ <b>Changed</b>\n• <b>{h(after['habit'])}</b> · {h(after['quantity'])} · "
-            f"{h(after['when'])}\n<i>was {h(before['quantity'])} · {h(before['when'])}</i>",
-            undo,
-        )
-    if status == "reverted":
-        return (
-            f"↩️ <b>Put back</b>: {h(before['quantity'])} of {h(before['habit'])} "
-            f"{h(before['when'])}",
-            None,
-        )
-    if status == "cancelled":
-        return "✖ OK, I left it as it was.", None
-    return f"🤔 {h(data.get('message') or 'I could not work out which log to change.')}", None
-
-
-def render_sql(title: str, sql: str) -> str:
-    return f"🔍 <b>{h(title)}</b>\n<pre>{h(sql.strip())}</pre>"
+def render_sql(title: str, sql: str) -> tuple[str, InlineKeyboardMarkup]:
+    return f"🔍 <b>{h(title)}</b>\n<pre>{h(sql.strip())}</pre>", _keyboard([("✖ Close", "close:0")])
 
 
 HELP_TEXT = (
@@ -439,11 +431,6 @@ HELP_TEXT = (
     "  “how many hours did I work last week?”\n"
     "  “which days did I skip meditation?”\n"
     "Tap 🔍 SQL to see exactly how it was counted.\n\n"
-    "<b>Fix</b> a saved log:\n"
-    "  “change yesterday's run to 6 km”\n"
-    "  “move today's reading to yesterday”\n"
-    "  “delete Monday's meditation”\n"
-    "You confirm first, and can undo it.\n\n"
     "<b>Commands</b>\n" + "\n".join(f"  /{name} — {h(desc)}" for name, desc in COMMANDS)
 )
 
@@ -731,9 +718,6 @@ async def _send_message(
     elif kind == "answer":
         text, markup = render_answer(data["answer"])
         await _reply(update.message, text, markup)
-    elif kind == "edit":
-        text, markup = render_edit(data["edit"])
-        await _reply(update.message, text, markup)
     elif kind == "chat":
         await _reply(update.message, HELP_TEXT)
     else:
@@ -1012,14 +996,7 @@ async def on_draft_sql(update, context, query, audit_id, extra):
         await query.answer("No SQL for this one.", show_alert=True)
         return
     await query.answer()
-    await _reply(query.message, render_sql("SQL for this log", sql))
-    if data.get("status") == "pending":
-        try:
-            await query.edit_message_reply_markup(
-                reply_markup=card_markup(audit_id, sql_button=False)
-            )
-        except Exception:
-            pass
+    await _reply(query.message, *render_sql("SQL for this log", sql))
 
 
 async def on_query_sql(update, context, query, query_id, extra):
@@ -1034,50 +1011,16 @@ async def on_query_sql(update, context, query, query_id, extra):
     await query.answer()
     data = r.json()
     title = "SQL used" + (" (built-in template)" if data.get("source") == "template" else "")
-    await _reply(query.message, render_sql(title, data["sql"]))
-    try:
-        await query.edit_message_reply_markup(reply_markup=None)
-    except Exception:
-        pass
+    await _reply(query.message, *render_sql(title, data["sql"]))
 
 
-async def _edit_step(query, edit_id: int, step: str, payload: dict | None = None):
-    """One step of a change to a saved log. The API's refusals are already
-    written for people ("A newer change replaced this one."), so show them."""
-    try:
-        r = await _post(f"/internal/edits/{edit_id}/{step}", payload or {})
-    except Exception:
-        log.exception("edit %s failed", step)
-        await query.answer(UNREACHABLE, show_alert=True)
-        return
-    if r.status_code >= 400:
-        detail = _detail(r)
-        await query.answer(detail if isinstance(detail, str) else _friendly_error(r),
-                           show_alert=True)
-        return
+async def on_close(update, context, query, _id, extra):
+    """✖ Close on an SQL message: remove it from the chat."""
     await query.answer()
-    text, markup = render_edit(r.json())
-    await _edit(query, text, markup)
-
-
-async def on_edit_apply(update, context, query, edit_id, extra):
-    await _edit_step(query, edit_id, "apply")
-
-
-async def on_edit_cancel(update, context, query, edit_id, extra):
-    await _edit_step(query, edit_id, "cancel")
-
-
-async def on_edit_pick(update, context, query, edit_id, extra):
-    if not (extra or "").isdigit():
-        await query.answer()
-        await query.edit_message_text("That button is no longer valid.")
-        return
-    await _edit_step(query, edit_id, "choose", {"log_id": int(extra)})
-
-
-async def on_edit_revert(update, context, query, edit_id, extra):
-    await _edit_step(query, edit_id, "undo")
+    try:
+        await query.message.delete()
+    except Exception:  # too old to delete (48 h) or no permission
+        await _edit(query, "🔍 SQL closed.")
 
 
 BUTTONS = {
@@ -1093,10 +1036,7 @@ BUTTONS = {
     "undo_audit": on_undo_audit,
     "sql": on_draft_sql,
     "qsql": on_query_sql,
-    "eapply": on_edit_apply,
-    "ecancel": on_edit_cancel,
-    "epick": on_edit_pick,
-    "erevert": on_edit_revert,
+    "close": on_close,
 }
 
 

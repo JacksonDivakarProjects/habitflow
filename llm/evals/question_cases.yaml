@@ -26,8 +26,6 @@ classify:
   - {text: "pushups twenty", kind: log}
   - {text: "worked all day on the report", kind: log}
   - {text: "am I improving", kind: query}
-  - {text: "the run on tuesday was actually 4 miles", kind: edit}
-  - {text: "i logged reading twice by mistake yesterday", kind: edit}
   - {text: "tell me a joke", kind: chat}
   - {text: "you're great", kind: chat}
 

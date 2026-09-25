@@ -430,6 +430,21 @@ def _llm_sql(
     )
 
 
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def readable_rows(rows: list[list]) -> list[list]:
+    """Rows for the LLM to phrase, with dates as people say them ("Mon 7 Sep"),
+    so they don't end up as "2026-09-07" in the answer."""
+    def cell(v):
+        if isinstance(v, str) and _ISO_DATE.fullmatch(v):
+            d = date.fromisoformat(v)
+            return f"{d:%a} {d.day} {d:%b}" + (f" {d.year}" if d.year != today().year else "")
+        return v
+
+    return [[cell(v) for v in r] for r in rows]
+
+
 def _phrase(question: str, result: Answer, anchors: dict) -> str:
     try:
         reply = llm_client.post(
@@ -438,7 +453,7 @@ def _phrase(question: str, result: Answer, anchors: dict) -> str:
                 "question": question,
                 "sql": result.sql,
                 "columns": result.columns,
-                "rows": result.rows[:ROWS_FOR_ANSWER],
+                "rows": readable_rows(result.rows[:ROWS_FOR_ANSWER]),
                 "row_count": result.row_count,
                 "truncated": result.truncated,
                 "dates": anchors,
